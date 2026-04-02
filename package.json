@@ -1,0 +1,49 @@
+{
+  "name": "surfagent-tradingview",
+  "version": "0.1.0",
+  "description": "TradingView adapter for SurfAgent — chart control, Pine Script dev, indicators, alerts, and real-time data via MCP. Requires SurfAgent browser running.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "tradingview",
+    "charts",
+    "pine-script",
+    "trading",
+    "surfagent",
+    "browser",
+    "ai-agent",
+    "technical-analysis"
+  ],
+  "homepage": "https://surfagent.app",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/surfagentapp/surfagent-tradingview"
+  },
+  "license": "MIT",
+  "author": "SurfAgent <support@surfagent.app>",
+  "bin": {
+    "surfagent-tradingview": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/index.js && chmod +x dist/index.js",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.3",
+    "chrome-remote-interface": "^0.33.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.5",
+    "esbuild": "^0.25.10",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
