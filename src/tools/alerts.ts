@@ -16,7 +16,7 @@ export const alertTools: ToolDefinition[] = [
   {
     name: "tv_alert_list",
     description:
-      "List all active alerts on TradingView. Returns alert conditions, status, and symbols.",
+      "Inspect the currently visible TradingView alerts surface. Returns alert rows when the alerts panel is already open, otherwise reports visible alert UI state without pretending hidden alerts were listed.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -26,32 +26,36 @@ export const alertTools: ToolDefinition[] = [
       const tabId = await requireTvTab();
 
       const alerts = await evaluate(`(() => {
-        // Try to open alerts panel and scrape
+        const warnings = [];
+
         try {
-          const alertsPanel = document.querySelector('[data-name="alerts"]') ||
-                              document.querySelector('[class*="alertsPanel"]');
+          const panel = document.querySelector('.widgetbar-widget-alerts, [data-qa-id="alerts-editor-header-title"], [role="dialog"]');
+          const rows = panel
+            ? Array.from(panel.querySelectorAll('[class*="alertItem"], [class*="alert-item"], [data-name*="alert-row"], [data-name*="alert-item"]')).slice(0, 100)
+            : [];
+          const alerts = rows.map((el, index) => ({
+            index,
+            text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 300),
+            active: !el.className.toString().toLowerCase().includes('inactive'),
+          })).filter((row) => row.text);
 
-          // If alerts panel exists, scrape its contents
-          const alertItems = document.querySelectorAll('[class*="alertItem"], [class*="alert-item"]');
-          if (alertItems.length > 0) {
-            return {
-              alerts: Array.from(alertItems).slice(0, 100).map((el, i) => ({
-                index: i,
-                text: (el.textContent || '').trim().slice(0, 300),
-                active: !el.classList.toString().includes('inactive')
-              })),
-              count: alertItems.length,
-              source: 'dom'
-            };
-          }
-        } catch {}
+          const emptyState = Array.from((panel || document).querySelectorAll('button, [role="button"]'))
+            .map((el) => (el.textContent || '').trim().replace(/\s+/g, ' '))
+            .filter(Boolean)
+            .slice(0, 20);
 
-        return {
-          alerts: [],
-          count: 0,
-          note: 'No alerts found. The alerts panel may need to be opened first.',
-          hint: 'Click the Alerts icon in the right panel to view alerts.'
-        };
+          return {
+            alerts,
+            count: alerts.length,
+            panelVisible: !!panel,
+            emptyStateHints: emptyState,
+            pathUsed: 'dom:alerts-panel',
+            warnings,
+          };
+        } catch (error) {
+          warnings.push(error?.message || String(error));
+          return { alerts: [], count: 0, panelVisible: false, pathUsed: 'none', warnings };
+        }
       })();`, tabId);
 
       return textResult(JSON.stringify(alerts, null, 2));
@@ -61,7 +65,7 @@ export const alertTools: ToolDefinition[] = [
   {
     name: "tv_alert_create",
     description:
-      "Open TradingView's alert creation dialog. Optionally pre-fill with a price level. The user will need to confirm the alert in the UI.",
+      "Open TradingView's alert creation dialog and report what became visible. This is a best-effort UI helper, not a guaranteed end-to-end alert creation API.",
     inputSchema: {
       type: "object",
       properties: {
@@ -95,34 +99,70 @@ export const alertTools: ToolDefinition[] = [
       }
       const tabId = await requireTvTab();
 
-      const result = await evaluate(`(() => {
+      const result = await evaluate(`(async () => {
         const price = ${price};
         const condition = ${JSON.stringify(condition)};
-
-        // Method 1: Keyboard shortcut Alt+A opens alert dialog
-        try {
-          document.dispatchEvent(new KeyboardEvent('keydown', {
-            key: 'a', code: 'KeyA', altKey: true, bubbles: true
-          }));
-          return {
-            opened: true,
-            method: 'keyboard',
-            price,
-            condition,
-            note: price ? 'Alert dialog opened. Set ' + condition + ' price to ' + price : 'Alert dialog opened.'
-          };
-        } catch {}
-
-        // Method 2: Click the alert button
-        try {
-          const btn = document.querySelector('[data-name="create-alert"], [aria-label="Alert"]');
-          if (btn) {
-            btn.click();
-            return { opened: true, method: 'button', price, condition };
+        const warnings = [];
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const click = (selector) => {
+          const el = document.querySelector(selector);
+          if (el instanceof HTMLElement) {
+            el.click();
+            return true;
           }
-        } catch {}
+          return false;
+        };
 
-        return { opened: false, hint: 'Could not open alert dialog' };
+        let method = 'none';
+        if (click('button[aria-label="Create alert"]') || click('[data-name="create-alert"]')) {
+          method = 'button:create-alert';
+        }
+        if (method === 'none' && click('[data-name="alerts"]')) {
+          method = 'button:alerts-panel';
+        }
+        if (method === 'none') {
+          try {
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', altKey: true, bubbles: true }));
+            method = 'keyboard:alt+a';
+          } catch (error) {
+            warnings.push('Alt+A dispatch failed: ' + (error?.message || String(error)));
+          }
+        }
+
+        await wait(500);
+
+        const dialog = document.querySelector('[data-qa-id="alerts-editor-header-title"]')?.closest('[role="dialog"]') || document.querySelector('[role="dialog"], .widgetbar-widget-alerts');
+        const buttons = Array.from((dialog || document).querySelectorAll('button, [role="button"]'))
+          .map((el) => (el.textContent || '').trim().replace(/\s+/g, ' '))
+          .filter(Boolean)
+          .slice(0, 20);
+
+        let prefillApplied = false;
+        if (price !== null) {
+          const numericInput = document.querySelector('[role="dialog"] input[data-qa-id*="Input-input"], [role="dialog"] input[type="number"], [role="dialog"] input[inputmode="decimal"], [role="dialog"] input:not([type]), .widgetbar-widget-alerts input[type="number"]');
+          if (numericInput instanceof HTMLInputElement) {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+            if (setter) {
+              setter.call(numericInput, String(price));
+              numericInput.dispatchEvent(new Event('input', { bubbles: true }));
+              numericInput.dispatchEvent(new Event('change', { bubbles: true }));
+              prefillApplied = numericInput.value === String(price);
+            }
+          } else {
+            warnings.push('No alert price field was found to prefill.');
+          }
+        }
+
+        return {
+          opened: !!dialog,
+          method,
+          condition,
+          price,
+          prefillApplied,
+          dialogVisible: !!dialog,
+          visibleButtons: buttons,
+          warnings,
+        };
       })();`, tabId);
 
       return textResult(JSON.stringify(result, null, 2));

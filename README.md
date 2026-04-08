@@ -2,7 +2,7 @@
 
 TradingView adapter for [SurfAgent](https://surfagent.app).
 
-This adapter gives AI agents TradingView-native chart tools so they can work with symbols, timeframes, indicators, alerts, drawings, watchlists, and Pine Script without reverse-engineering the UI every run.
+This adapter gives AI agents TradingView-focused chart tools so they can work with symbols, timeframes, indicators, drawings, alerts, watchlists, and Pine Script from the SurfAgent browser.
 
 ## What this adapter is for
 
@@ -23,14 +23,20 @@ Use `surfagent-tradingview` when you need workflows like:
 
 The base `surfagent-mcp` gives generic browser control.
 
-This adapter adds TradingView-native verbs so an agent can say:
+This adapter adds TradingView-specific verbs so an agent can say:
 - `tv_set_timeframe`
 - `tv_set_symbol`
 - `tv_quote`
 - `tv_alert_create`
 - `tv_pine_compile`
 
-instead of fumbling around with brittle UI selectors.
+instead of doing everything through raw browser clicks.
+
+Some tools are stronger than others:
+- API-backed / stronger: chart state, symbol or timeframe changes, data reads, drawings
+- UI-backed / best-effort: alerts, Pine editor workflows, watchlist workflows
+
+That distinction matters. TradingView still exposes some surfaces only through the live web UI, so this adapter stays honest about best-effort operations instead of pretending every tool is equally native.
 
 ## Tool groups
 
@@ -58,6 +64,8 @@ instead of fumbling around with brittle UI selectors.
 - `tv_alert_list`
 - `tv_alert_create`
 
+These are best-effort UI helpers. They inspect or open the visible alerts UI, but they are not a guaranteed hidden-alert inventory or full alert-creation API.
+
 ### Drawings
 - `tv_draw_horizontal`
 - `tv_drawings_list`
@@ -69,9 +77,13 @@ instead of fumbling around with brittle UI selectors.
 - `tv_pine_compile`
 - `tv_pine_get_errors`
 
+These operate through TradingView's visible Pine editor UI. They do not use a native Pine API.
+
 ### Watchlist
 - `tv_watchlist`
 - `tv_watchlist_add`
+
+These are UI-backed and depend on the currently visible TradingView watchlist surface.
 
 ## Prerequisites
 
@@ -113,7 +125,7 @@ Run this adapter alongside the base SurfAgent MCP.
 
 - use `surfagent-mcp` for raw browser control
 - use `surfagent-skills` for execution discipline and workflow rules
-- use `surfagent-tradingview` when you want chart-native tools instead of brittle click choreography
+- use `surfagent-tradingview` when you want TradingView-aware tools instead of rebuilding the workflow from raw browser actions each time
 
 ## Why SurfAgent instead of TradingView Desktop-only automation
 

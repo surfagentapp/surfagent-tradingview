@@ -21876,7 +21876,7 @@ async function requireTvTab2() {
 var alertTools = [
   {
     name: "tv_alert_list",
-    description: "List all active alerts on TradingView. Returns alert conditions, status, and symbols.",
+    description: "Inspect the currently visible TradingView alerts surface. Returns alert rows when the alerts panel is already open, otherwise reports visible alert UI state without pretending hidden alerts were listed.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -21885,39 +21885,43 @@ var alertTools = [
     handler: async () => {
       const tabId = await requireTvTab2();
       const alerts = await evaluate(`(() => {
-        // Try to open alerts panel and scrape
+        const warnings = [];
+
         try {
-          const alertsPanel = document.querySelector('[data-name="alerts"]') ||
-                              document.querySelector('[class*="alertsPanel"]');
+          const panel = document.querySelector('.widgetbar-widget-alerts, [data-qa-id="alerts-editor-header-title"], [role="dialog"]');
+          const rows = panel
+            ? Array.from(panel.querySelectorAll('[class*="alertItem"], [class*="alert-item"], [data-name*="alert-row"], [data-name*="alert-item"]')).slice(0, 100)
+            : [];
+          const alerts = rows.map((el, index) => ({
+            index,
+            text: (el.textContent || '').trim().replace(/s+/g, ' ').slice(0, 300),
+            active: !el.className.toString().toLowerCase().includes('inactive'),
+          })).filter((row) => row.text);
 
-          // If alerts panel exists, scrape its contents
-          const alertItems = document.querySelectorAll('[class*="alertItem"], [class*="alert-item"]');
-          if (alertItems.length > 0) {
-            return {
-              alerts: Array.from(alertItems).slice(0, 100).map((el, i) => ({
-                index: i,
-                text: (el.textContent || '').trim().slice(0, 300),
-                active: !el.classList.toString().includes('inactive')
-              })),
-              count: alertItems.length,
-              source: 'dom'
-            };
-          }
-        } catch {}
+          const emptyState = Array.from((panel || document).querySelectorAll('button, [role="button"]'))
+            .map((el) => (el.textContent || '').trim().replace(/s+/g, ' '))
+            .filter(Boolean)
+            .slice(0, 20);
 
-        return {
-          alerts: [],
-          count: 0,
-          note: 'No alerts found. The alerts panel may need to be opened first.',
-          hint: 'Click the Alerts icon in the right panel to view alerts.'
-        };
+          return {
+            alerts,
+            count: alerts.length,
+            panelVisible: !!panel,
+            emptyStateHints: emptyState,
+            pathUsed: 'dom:alerts-panel',
+            warnings,
+          };
+        } catch (error) {
+          warnings.push(error?.message || String(error));
+          return { alerts: [], count: 0, panelVisible: false, pathUsed: 'none', warnings };
+        }
       })();`, tabId);
       return textResult(JSON.stringify(alerts, null, 2));
     }
   },
   {
     name: "tv_alert_create",
-    description: "Open TradingView's alert creation dialog. Optionally pre-fill with a price level. The user will need to confirm the alert in the UI.",
+    description: "Open TradingView's alert creation dialog and report what became visible. This is a best-effort UI helper, not a guaranteed end-to-end alert creation API.",
     inputSchema: {
       type: "object",
       properties: {
@@ -21950,34 +21954,70 @@ var alertTools = [
         throw new Error("condition must be one of: crossing, crossing_up, crossing_down, greater_than, less_than.");
       }
       const tabId = await requireTvTab2();
-      const result = await evaluate(`(() => {
+      const result = await evaluate(`(async () => {
         const price = ${price};
         const condition = ${JSON.stringify(condition)};
-
-        // Method 1: Keyboard shortcut Alt+A opens alert dialog
-        try {
-          document.dispatchEvent(new KeyboardEvent('keydown', {
-            key: 'a', code: 'KeyA', altKey: true, bubbles: true
-          }));
-          return {
-            opened: true,
-            method: 'keyboard',
-            price,
-            condition,
-            note: price ? 'Alert dialog opened. Set ' + condition + ' price to ' + price : 'Alert dialog opened.'
-          };
-        } catch {}
-
-        // Method 2: Click the alert button
-        try {
-          const btn = document.querySelector('[data-name="create-alert"], [aria-label="Alert"]');
-          if (btn) {
-            btn.click();
-            return { opened: true, method: 'button', price, condition };
+        const warnings = [];
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const click = (selector) => {
+          const el = document.querySelector(selector);
+          if (el instanceof HTMLElement) {
+            el.click();
+            return true;
           }
-        } catch {}
+          return false;
+        };
 
-        return { opened: false, hint: 'Could not open alert dialog' };
+        let method = 'none';
+        if (click('button[aria-label="Create alert"]') || click('[data-name="create-alert"]')) {
+          method = 'button:create-alert';
+        }
+        if (method === 'none' && click('[data-name="alerts"]')) {
+          method = 'button:alerts-panel';
+        }
+        if (method === 'none') {
+          try {
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', altKey: true, bubbles: true }));
+            method = 'keyboard:alt+a';
+          } catch (error) {
+            warnings.push('Alt+A dispatch failed: ' + (error?.message || String(error)));
+          }
+        }
+
+        await wait(500);
+
+        const dialog = document.querySelector('[data-qa-id="alerts-editor-header-title"]')?.closest('[role="dialog"]') || document.querySelector('[role="dialog"], .widgetbar-widget-alerts');
+        const buttons = Array.from((dialog || document).querySelectorAll('button, [role="button"]'))
+          .map((el) => (el.textContent || '').trim().replace(/s+/g, ' '))
+          .filter(Boolean)
+          .slice(0, 20);
+
+        let prefillApplied = false;
+        if (price !== null) {
+          const numericInput = document.querySelector('[role="dialog"] input[data-qa-id*="Input-input"], [role="dialog"] input[type="number"], [role="dialog"] input[inputmode="decimal"], [role="dialog"] input:not([type]), .widgetbar-widget-alerts input[type="number"]');
+          if (numericInput instanceof HTMLInputElement) {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+            if (setter) {
+              setter.call(numericInput, String(price));
+              numericInput.dispatchEvent(new Event('input', { bubbles: true }));
+              numericInput.dispatchEvent(new Event('change', { bubbles: true }));
+              prefillApplied = numericInput.value === String(price);
+            }
+          } else {
+            warnings.push('No alert price field was found to prefill.');
+          }
+        }
+
+        return {
+          opened: !!dialog,
+          method,
+          condition,
+          price,
+          prefillApplied,
+          dialogVisible: !!dialog,
+          visibleButtons: buttons,
+          warnings,
+        };
       })();`, tabId);
       return textResult(JSON.stringify(result, null, 2));
     }
@@ -22025,30 +22065,61 @@ var drawingTools = [
         const color = ${JSON.stringify(color)};
         const label = ${JSON.stringify(label)};
         const lineStyle = ${lineStyleNum};
+        const warnings = [];
+
+        const getChart = () => {
+          try {
+            const chart = window.TradingViewApi?.activeChart?.();
+            if (chart) return { chart, pathUsed: 'tradingview_api' };
+          } catch (error) {
+            warnings.push('TradingViewApi chart lookup failed: ' + (error?.message || String(error)));
+          }
+          try {
+            const chart = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.activeChart?.()
+              || window._exposed_chartWidgetCollection?.activeChartWidget?._value?.activeChart?.();
+            if (chart) return { chart, pathUsed: 'active_chart_widget' };
+          } catch (error) {
+            warnings.push('Active widget chart lookup failed: ' + (error?.message || String(error)));
+          }
+          return { chart: null, pathUsed: 'none' };
+        };
 
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart && chart.createShape) {
-            const shapeId = chart.createShape(
-              { price: price },
-              {
-                shape: 'horizontal_line',
-                overrides: {
-                  linecolor: color,
-                  linestyle: lineStyle,
-                  linewidth: 2,
-                  showLabel: !!label,
-                  text: label
-                }
-              }
-            );
-            return { success: true, shapeId, price, color, label, method: 'api' };
+          const { chart, pathUsed } = getChart();
+          if (!chart?.createShape) {
+            return { success: false, pathUsed, warnings, hint: 'Chart API not available for drawing' };
           }
-        } catch (e) {
-          return { success: false, error: e.message };
-        }
 
-        return { success: false, hint: 'Chart API not available for drawing' };
+          const before = chart.getAllShapes?.() || [];
+          const shapeId = chart.createShape(
+            { price },
+            {
+              shape: 'horizontal_line',
+              overrides: {
+                linecolor: color,
+                linestyle: lineStyle,
+                linewidth: 2,
+                showLabel: !!label,
+                text: label,
+              },
+            },
+          );
+          const after = chart.getAllShapes?.() || [];
+
+          return {
+            success: true,
+            shapeId,
+            price,
+            color,
+            label,
+            pathUsed,
+            countBefore: before.length,
+            countAfter: after.length,
+            warnings,
+          };
+        } catch (error) {
+          return { success: false, pathUsed: 'none', warnings, error: error?.message || String(error) };
+        }
       })();`, tabId);
       return textResult(JSON.stringify(result, null, 2));
     }
@@ -22064,22 +22135,44 @@ var drawingTools = [
     handler: async () => {
       const tabId = await requireTvTab3();
       const drawings = await evaluate(`(() => {
+        const warnings = [];
+        const getChart = () => {
+          try {
+            const chart = window.TradingViewApi?.activeChart?.();
+            if (chart) return { chart, pathUsed: 'tradingview_api' };
+          } catch (error) {
+            warnings.push('TradingViewApi chart lookup failed: ' + (error?.message || String(error)));
+          }
+          try {
+            const chart = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.activeChart?.()
+              || window._exposed_chartWidgetCollection?.activeChartWidget?._value?.activeChart?.();
+            if (chart) return { chart, pathUsed: 'active_chart_widget' };
+          } catch (error) {
+            warnings.push('Active widget chart lookup failed: ' + (error?.message || String(error)));
+          }
+          return { chart: null, pathUsed: 'none' };
+        };
+
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (!chart) return { error: 'Chart API not available' };
+          const { chart, pathUsed } = getChart();
+          if (!chart?.getAllShapes) {
+            return { drawings: [], count: 0, pathUsed, warnings, error: 'Chart drawing API not available' };
+          }
 
           const shapes = chart.getAllShapes?.() || [];
           return {
-            drawings: shapes.map(s => ({
-              id: s.id,
-              name: s.name || s.type || '',
-              type: s.type || ''
+            drawings: shapes.map((shape, index) => ({
+              index,
+              id: shape?.id ?? null,
+              name: shape?.name || shape?.type || '',
+              type: shape?.type || '',
             })),
             count: shapes.length,
-            source: 'api'
+            pathUsed,
+            warnings,
           };
-        } catch (e) {
-          return { error: e.message };
+        } catch (error) {
+          return { drawings: [], count: 0, pathUsed: 'none', warnings, error: error?.message || String(error) };
         }
       })();`, tabId);
       return textResult(JSON.stringify(drawings, null, 2));
@@ -22096,16 +22189,43 @@ var drawingTools = [
     handler: async () => {
       const tabId = await requireTvTab3();
       const result = await evaluate(`(() => {
-        try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart && chart.removeAllShapes) {
-            chart.removeAllShapes();
-            return { success: true, method: 'api' };
+        const warnings = [];
+        const getChart = () => {
+          try {
+            const chart = window.TradingViewApi?.activeChart?.();
+            if (chart) return { chart, pathUsed: 'tradingview_api' };
+          } catch (error) {
+            warnings.push('TradingViewApi chart lookup failed: ' + (error?.message || String(error)));
           }
-        } catch (e) {
-          return { success: false, error: e.message };
+          try {
+            const chart = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.activeChart?.()
+              || window._exposed_chartWidgetCollection?.activeChartWidget?._value?.activeChart?.();
+            if (chart) return { chart, pathUsed: 'active_chart_widget' };
+          } catch (error) {
+            warnings.push('Active widget chart lookup failed: ' + (error?.message || String(error)));
+          }
+          return { chart: null, pathUsed: 'none' };
+        };
+
+        try {
+          const { chart, pathUsed } = getChart();
+          if (chart?.removeAllShapes) {
+            const before = chart.getAllShapes?.() || [];
+            chart.removeAllShapes();
+            const after = chart.getAllShapes?.() || [];
+            return { success: true, pathUsed, countBefore: before.length, countAfter: after.length, warnings };
+          }
+
+          const action = window._exposed_chartWidgetCollection?.activeChartWidget?._value?._actions?.paneRemoveAllDrawingTools;
+          if (action?.execute) {
+            action.execute();
+            return { success: true, pathUsed: 'action:paneRemoveAllDrawingTools', warnings };
+          }
+
+          return { success: false, pathUsed, warnings, hint: 'Chart drawing clear API not available' };
+        } catch (error) {
+          return { success: false, pathUsed: 'none', warnings, error: error?.message || String(error) };
         }
-        return { success: false, hint: 'Chart API not available' };
       })();`, tabId);
       return textResult(JSON.stringify(result, null, 2));
     }
@@ -22130,34 +22250,50 @@ var pineTools = [
     },
     handler: async () => {
       const tabId = await requireTvTab4();
-      const result = await evaluate(`(() => {
-        // Try clicking the Pine Editor tab
-        try {
-          const tabs = Array.from(document.querySelectorAll('[class*="tabs"] button, [data-name="pine-editor"]'));
-          const pineTab = tabs.find(t => (t.textContent || '').toLowerCase().includes('pine'));
-          if (pineTab) {
-            pineTab.click();
-            return { opened: true, method: 'tab_click' };
+      const result = await evaluate(`(async () => {
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const click = (selector) => {
+          const el = document.querySelector(selector);
+          if (el instanceof HTMLElement) {
+            el.click();
+            return true;
           }
-        } catch {}
+          return false;
+        };
 
-        // Try the bottom panel toggle
-        try {
-          const toggle = document.querySelector('[data-name="pine-editor-toggle"]');
-          if (toggle) {
-            toggle.click();
-            return { opened: true, method: 'toggle' };
-          }
-        } catch {}
+        if (document.querySelector('[data-name="pine-dialog"]')) {
+          return {
+            opened: true,
+            method: 'already_open',
+            dialogVisible: true,
+            hasEditorTextarea: !!document.querySelector('[data-name="pine-dialog"] textarea[aria-label*="Editor content"], [data-name="pine-dialog"] textarea.inputarea, textarea.inputarea'),
+          };
+        }
 
-        return { opened: false, hint: 'Pine Editor tab not found. It may already be open or the layout may differ.' };
+        let method = 'none';
+        if (click('[data-name="pine-dialog-button"]')) {
+          method = 'data-name:pine-dialog-button';
+        } else if (click('[aria-label="Pine"]')) {
+          method = 'aria:Pine';
+        } else if (click('[data-name="pine-editor-toggle"]')) {
+          method = 'data-name:pine-editor-toggle';
+        }
+
+        await wait(300);
+        const dialog = document.querySelector('[data-name="pine-dialog"]');
+        return {
+          opened: !!dialog,
+          method,
+          dialogVisible: !!dialog,
+          hasEditorTextarea: !!document.querySelector('[data-name="pine-dialog"] textarea[aria-label*="Editor content"], [data-name="pine-dialog"] textarea.inputarea, textarea.inputarea'),
+        };
       })();`, tabId);
       return textResult(JSON.stringify(result, null, 2));
     }
   },
   {
     name: "tv_pine_set_source",
-    description: "Set the Pine Script source code in the editor. Replaces all existing code. Call tv_pine_open_editor first.",
+    description: "Set the Pine Script source code in the visible TradingView Pine editor textarea. This is a DOM-backed editor operation, not a native Pine API.",
     inputSchema: {
       type: "object",
       properties: {
@@ -22172,54 +22308,62 @@ var pineTools = [
     handler: async (args) => {
       const input = asObject(args, "tv_pine_set_source arguments");
       const code = asString(input.code, "code");
+      const encodedCode = Buffer.from(code, "utf8").toString("base64");
       const tabId = await requireTvTab4();
-      const result = await evaluate(`(() => {
-        const code = ${JSON.stringify(code)};
-
-        // Find the CodeMirror / Monaco editor instance
-        try {
-          // TradingView uses their own editor based on CodeMirror
-          const editorEl = document.querySelector('[class*="pine-editor"] .view-lines, [class*="pine-editor"] .CodeMirror');
-
-          // Try CodeMirror API
-          const cm = editorEl?.closest('.CodeMirror')?.CodeMirror;
-          if (cm) {
-            cm.setValue(code);
-            return { success: true, method: 'codemirror', lines: code.split('\\n').length };
+      const result = await evaluate(`(async () => {
+        const code = (() => {
+          const encoded = ${JSON.stringify(encodedCode)};
+          const binary = atob(encoded);
+          const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+          return new TextDecoder().decode(bytes);
+        })();
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const click = (selector) => {
+          const el = document.querySelector(selector);
+          if (el instanceof HTMLElement) {
+            el.click();
+            return true;
           }
-        } catch {}
+          return false;
+        };
 
-        // Try Monaco editor
+        if (!document.querySelector('[data-name="pine-dialog"]')) {
+          click('[data-name="pine-dialog-button"]');
+          await wait(250);
+        }
+
+        const textarea = document.querySelector('[data-name="pine-dialog"] textarea[aria-label*="Editor content"], [data-name="pine-dialog"] textarea.inputarea, textarea.inputarea');
+        if (!(textarea instanceof HTMLTextAreaElement)) {
+          return { success: false, method: 'none', hint: 'Could not find Pine editor textarea. Make sure the editor is open.' };
+        }
+
+        textarea.focus();
+        textarea.select();
+        let method = 'execCommand:insertText';
         try {
-          const monacoEditors = window.monaco?.editor?.getEditors?.() || [];
-          if (monacoEditors.length > 0) {
-            monacoEditors[0].setValue(code);
-            return { success: true, method: 'monaco', lines: code.split('\\n').length };
-          }
-        } catch {}
+          document.execCommand('insertText', false, code);
+        } catch {
+          method = 'setRangeText';
+          textarea.setSelectionRange(0, textarea.value.length);
+          textarea.setRangeText(code, 0, textarea.value.length, 'end');
+        }
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        await wait(500);
 
-        // Try textarea fallback
-        try {
-          const textarea = document.querySelector('[class*="pine-editor"] textarea');
-          if (textarea) {
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-            if (!nativeInputValueSetter) {
-              throw new Error('Textarea value setter not available');
-            }
-            nativeInputValueSetter.call(textarea, code);
-            textarea.dispatchEvent(new Event('input', { bubbles: true }));
-            return { success: true, method: 'textarea', lines: code.split('\\n').length };
-          }
-        } catch {}
-
-        return { success: false, hint: 'Could not find Pine Script editor. Make sure it is open (use tv_pine_open_editor).' };
+        return {
+          success: textarea.value === code,
+          method,
+          lines: code.split('\\n').length,
+          chars: code.length,
+          verifiedLength: textarea.value.length,
+        };
       })();`, tabId);
       return textResult(JSON.stringify(result, null, 2));
     }
   },
   {
     name: "tv_pine_compile",
-    description: "Compile (Add to Chart) the current Pine Script in the editor. Returns compilation status.",
+    description: "Trigger the visible Pine editor's Add to chart or Update on chart action. This reports whether the UI action was triggered, not whether TradingView accepted the script cleanly.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -22227,29 +22371,65 @@ var pineTools = [
     },
     handler: async () => {
       const tabId = await requireTvTab4();
-      const result = await evaluate(`(() => {
-        // Click "Add to Chart" button
-        try {
-          const buttons = Array.from(document.querySelectorAll('[class*="pine-editor"] button, [class*="scriptEditor"] button'));
-          const addBtn = buttons.find(b => {
-            const text = (b.textContent || '').toLowerCase();
-            return text.includes('add to chart') || text.includes('apply') || text.includes('update');
-          });
-
-          if (addBtn) {
-            addBtn.click();
-            return { triggered: true, method: 'button_click', note: 'Compilation triggered. Check for errors in the editor output.' };
+      const result = await evaluate(`(async () => {
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const click = (selector) => {
+          const el = document.querySelector(selector);
+          if (el instanceof HTMLElement) {
+            el.click();
+            return true;
           }
-        } catch {}
+          return false;
+        };
+        const text = (el) => (el?.textContent || '').trim().replace(/s+/g, ' ').toLowerCase();
 
-        return { triggered: false, hint: 'Could not find the compile/add button. The Pine Editor may not be open.' };
+        if (!document.querySelector('[data-name="pine-dialog"]')) {
+          click('[data-name="pine-dialog-button"]');
+          await wait(250);
+        }
+
+        let method = 'none';
+        const buttons = Array.from(document.querySelectorAll('[data-name="pine-dialog"] button, [data-name="pine-dialog"] [role="button"], button[title="Add to chart"], button[title="Update on chart"], [aria-label="Add to chart"], [aria-label="Update on chart"]'));
+        const compileButton = buttons.find((button) => {
+          const hay = [text(button), button.getAttribute('aria-label') || '', button.getAttribute('title') || '', button.getAttribute('data-name') || ''].join(' ').toLowerCase();
+          return hay.includes('add to chart') || hay.includes('update on chart') || hay.includes('apply') || hay.includes('compile');
+        });
+        if (compileButton instanceof HTMLElement) {
+          compileButton.click();
+          method = 'button';
+        }
+
+        if (method === 'none') {
+          const textarea = document.querySelector('[data-name="pine-dialog"] textarea[aria-label*="Editor content"], textarea.inputarea');
+          if (textarea instanceof HTMLTextAreaElement) {
+            textarea.focus();
+            for (const eventType of ['keydown', 'keyup']) {
+              textarea.dispatchEvent(new KeyboardEvent(eventType, { key: 'Enter', code: 'Enter', ctrlKey: true, metaKey: true, bubbles: true }));
+            }
+            method = 'keyboard:ctrl+enter';
+          }
+        }
+
+        await wait(500);
+        const root = document.querySelector('[data-name="pine-dialog"]') || document;
+        const errorEls = Array.from(root.querySelectorAll('[role="alert"], [title="Compilation error"], [class*="error"], [class*="notification"], [class*="message"], [class*="problems"]'));
+        const errors = errorEls
+          .map((el) => (el.textContent || '').trim().replace(/s+/g, ' ').slice(0, 300))
+          .filter(Boolean);
+
+        return {
+          triggered: method !== 'none',
+          method,
+          errorCount: errors.length,
+          errors,
+        };
       })();`, tabId);
       return textResult(JSON.stringify(result, null, 2));
     }
   },
   {
     name: "tv_pine_get_errors",
-    description: "Get any compilation errors from the Pine Script editor.",
+    description: "Read the currently visible Pine editor messages, warnings, and error badges. This reflects visible UI state, which may include stale messages if TradingView has not cleared them yet.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -22258,22 +22438,26 @@ var pineTools = [
     handler: async () => {
       const tabId = await requireTvTab4();
       const result = await evaluate(`(() => {
+        const text = (el) => (el?.textContent || '').trim().replace(/s+/g, ' ').slice(0, 500);
         try {
-          // Look for error messages in the Pine editor output
-          const errorEls = document.querySelectorAll('[class*="pine-editor"] [class*="error"], [class*="scriptEditor"] [class*="error"], [class*="consoleRow"]');
-          const errors = Array.from(errorEls).map(el => ({
-            text: (el.textContent || '').trim().slice(0, 500),
-            type: el.classList.toString().includes('error') ? 'error' : 'info'
-          })).filter(e => e.text);
+          const root = document.querySelector('[data-name="pine-dialog"]') || document;
+          const errorEls = Array.from(root.querySelectorAll('[role="alert"], [title="Compilation error"], [class*="error"], [class*="notification"], [class*="message"], [class*="problems"]'));
+          const errors = errorEls
+            .map((el) => ({
+              text: text(el),
+              type: el.className.toString().toLowerCase().includes('error') ? 'error' : 'info',
+            }))
+            .filter((entry) => entry.text);
 
           return {
             errors,
-            hasErrors: errors.some(e => e.type === 'error'),
-            count: errors.length
+            hasErrors: errors.some((entry) => entry.type === 'error'),
+            count: errors.length,
+            dialogVisible: !!document.querySelector('[data-name="pine-dialog"]'),
           };
-        } catch {}
-
-        return { errors: [], hasErrors: false, count: 0, note: 'Could not read editor output' };
+        } catch (error) {
+          return { errors: [], hasErrors: false, count: 0, dialogVisible: false, note: error?.message || String(error) };
+        }
       })();`, tabId);
       return textResult(JSON.stringify(result, null, 2));
     }
@@ -22290,7 +22474,7 @@ async function requireTvTab5() {
 var watchlistTools = [
   {
     name: "tv_watchlist",
-    description: "Get the current watchlist symbols and their quick stats.",
+    description: "Inspect the currently visible TradingView watchlist surface and extract any visible symbols and quick stats. This is a UI-backed best-effort read.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -22298,33 +22482,68 @@ var watchlistTools = [
     },
     handler: async () => {
       const tabId = await requireTvTab5();
-      const result = await evaluate(`(() => {
+      const result = await evaluate(`(async () => {
+        const warnings = [];
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const click = (selector) => {
+          const el = document.querySelector(selector);
+          if (el instanceof HTMLElement) {
+            el.click();
+            return true;
+          }
+          return false;
+        };
         try {
-          const rows = document.querySelectorAll('[class*="watchlist"] [class*="listRow"], [data-name="symbol-list"] [class*="row"]');
-          const symbols = Array.from(rows).slice(0, 100).map((row, i) => {
-            const symbolEl = row.querySelector('[class*="symbol"], [class*="tickerName"]');
-            const priceEl = row.querySelector('[class*="last"], [class*="price"]');
-            const changeEl = row.querySelector('[class*="change"]');
+          if (!document.querySelector('[data-name="add-symbol-button"], [aria-label="Add symbol"]')) {
+            click('[data-name="base"]');
+            await wait(100);
+            click('[data-name="watchlists-button"]');
+            await wait(250);
+          }
 
+          const rows = Array.from(document.querySelectorAll('[data-name="symbol-list-wrap"] [data-symbol-short], [data-name="symbol-list-wrap"] [data-symbol-full], .widgetbar-widget-watchlist [data-symbol-short], .widgetbar-widget-watchlist [data-symbol-full]')).slice(0, 100);
+          const seen = new Set();
+          const symbols = rows.map((row, index) => {
+            const rawText = (row.textContent || '').trim().replace(/s+/g, ' ');
+            const symbol = row.getAttribute('data-symbol-short')
+              || row.getAttribute('data-symbol-full')
+              || row.querySelector?.('[data-name="list-item-title"]')?.textContent?.trim()
+              || rawText.match(/[A-Z][A-Z0-9._:-]{1,19}/)?.[0]
+              || rawText.split(/s+/)[0]
+              || '';
+            const last = rawText.match(/[-+]?d[d,]*(?:.d+)?/)?.[0] || null;
+            const changePercent = rawText.match(/[-+\u2212]?d+(?:.d+)?%/)?.[0] || null;
             return {
-              index: i,
-              symbol: symbolEl?.textContent?.trim() || '',
-              price: priceEl?.textContent?.trim() || '',
-              change: changeEl?.textContent?.trim() || '',
+              index,
+              symbol: symbol.toUpperCase(),
+              rawText,
+              last,
+              changePercent,
             };
-          }).filter(s => s.symbol);
+          }).filter((row) => {
+            if (!row.symbol || !/^[A-Z0-9._:-]{2,20}$/.test(row.symbol) || seen.has(row.symbol)) return false;
+            seen.add(row.symbol);
+            return true;
+          });
 
-          return { symbols, count: symbols.length, source: 'dom' };
-        } catch {}
-
-        return { symbols: [], count: 0, note: 'Watchlist panel may not be visible' };
+          return {
+            symbols,
+            count: symbols.length,
+            panelVisible: !!document.querySelector('[data-name="symbol-list-wrap"], .widgetbar-widget-watchlist'),
+            pathUsed: 'dom:data-symbol-short',
+            warnings,
+          };
+        } catch (error) {
+          warnings.push(error?.message || String(error));
+          return { symbols: [], count: 0, panelVisible: false, pathUsed: 'none', warnings };
+        }
       })();`, tabId);
       return textResult(JSON.stringify(result, null, 2));
     }
   },
   {
     name: "tv_watchlist_add",
-    description: "Add a symbol to the TradingView watchlist.",
+    description: "Attempt to add a symbol through TradingView's visible watchlist add-symbol dialog, then check whether it appears in the visible watchlist.",
     inputSchema: {
       type: "object",
       properties: {
@@ -22335,34 +22554,88 @@ var watchlistTools = [
     },
     handler: async (args) => {
       const input = asObject(args, "tv_watchlist_add arguments");
-      const symbol2 = asString(input.symbol, "symbol");
+      const symbol2 = asString(input.symbol, "symbol").trim().toUpperCase();
       const tabId = await requireTvTab5();
-      const result = await evaluate(`(() => {
+      const result = await evaluate(`(async () => {
         const symbol = ${JSON.stringify(symbol2)};
-
-        // Try to find and click the "+" button in watchlist
-        try {
-          const addBtn = document.querySelector('[class*="watchlist"] [class*="add"], [data-name="add-symbol-button"]');
-          if (addBtn) {
-            addBtn.click();
-            const input = document.querySelector('[class*="search"] input, [data-name="symbol-search-input"]');
-            if (input) {
-              const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-              if (!nativeSetter) {
-                throw new Error('Input value setter not available');
-              }
-              nativeSetter.call(input, symbol);
-              input.dispatchEvent(new Event('input', { bubbles: true }));
-              input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
-              input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
-              return { triggered: true, symbol, note: 'Attempted to add symbol to watchlist.' };
-            }
-
-            return { triggered: true, symbol, note: 'Watchlist add opened, but symbol input was not found.' };
+        const warnings = [];
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const click = (selector) => {
+          const el = document.querySelector(selector);
+          if (el instanceof HTMLElement) {
+            el.click();
+            return true;
           }
-        } catch {}
+          return false;
+        };
+        const findVisibleSymbol = () => Array.from(document.querySelectorAll('[data-name="symbol-list-wrap"] [data-symbol-short], [data-name="symbol-list-wrap"] [data-symbol-full], .widgetbar-widget-watchlist [data-symbol-short], .widgetbar-widget-watchlist [data-symbol-full]'))
+          .map((el) => (el.getAttribute('data-symbol-short') || el.getAttribute('data-symbol-full') || '').trim().toUpperCase())
+          .filter(Boolean)
+          .includes(symbol);
 
-        return { triggered: false, symbol, hint: 'Could not find watchlist add button' };
+        try {
+          if (findVisibleSymbol()) {
+            return { success: true, symbol, pathUsed: 'already_visible', dialogVisible: false, nowVisibleInWatchlist: true, warnings };
+          }
+
+          let addOpened = click('[data-name="add-symbol-button"]') || click('[aria-label="Add symbol"]');
+          if (!addOpened) {
+            click('[data-name="base"]');
+            await wait(100);
+            if (!document.querySelector('[data-name="add-symbol-button"], [aria-label="Add symbol"]')) {
+              click('[data-name="watchlists-button"]');
+              await wait(150);
+            }
+            addOpened = click('[data-name="add-symbol-button"]') || click('[aria-label="Add symbol"]');
+          }
+          if (!addOpened) {
+            return { success: false, symbol, pathUsed: 'none', warnings, hint: 'Could not find watchlist add button' };
+          }
+
+          await wait(300);
+          const input = document.querySelector('[data-name="watchlist-symbol-search-dialog"] input[data-qa-id="symbol-search-input"], [data-name="watchlist-symbol-search-dialog"] input, input[placeholder*="Symbol"], input[placeholder*="CUSIP"], input[placeholder*="ISIN"]');
+          if (!(input instanceof HTMLInputElement)) {
+            return { success: false, symbol, pathUsed: 'watchlist_dialog', warnings, hint: 'Watchlist symbol search input was not found' };
+          }
+
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+          if (!setter) {
+            throw new Error('Input value setter not available');
+          }
+          setter.call(input, symbol);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          await wait(500);
+
+          const results = Array.from(document.querySelectorAll('[data-name="watchlist-symbol-search-dialog"] [data-name="symbol-search-dialog-content-item"]'));
+          const matchedResult = results.find((row) => {
+            const title = row.querySelector('[data-name="list-item-title"]')?.textContent?.trim()?.toUpperCase() || '';
+            const text = (row.textContent || '').trim().replace(/s+/g, ' ').toUpperCase();
+            return title === symbol || text.includes(symbol);
+          });
+          if (matchedResult instanceof HTMLElement) {
+            matchedResult.click();
+          } else if (results[0] instanceof HTMLElement) {
+            results[0].click();
+          } else {
+            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+          }
+          await wait(1200);
+
+          return {
+            success: findVisibleSymbol(),
+            symbol,
+            pathUsed: 'watchlist_dialog',
+            dialogVisible: !!document.querySelector('[data-name="watchlist-symbol-search-dialog"]'),
+            nowVisibleInWatchlist: findVisibleSymbol(),
+            warnings,
+          };
+        } catch (error) {
+          warnings.push(error?.message || String(error));
+          return { success: false, symbol, pathUsed: 'none', warnings };
+        }
       })();`, tabId);
       return textResult(JSON.stringify(result, null, 2));
     }

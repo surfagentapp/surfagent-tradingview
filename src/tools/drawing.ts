@@ -49,30 +49,61 @@ export const drawingTools: ToolDefinition[] = [
         const color = ${JSON.stringify(color)};
         const label = ${JSON.stringify(label)};
         const lineStyle = ${lineStyleNum};
+        const warnings = [];
+
+        const getChart = () => {
+          try {
+            const chart = window.TradingViewApi?.activeChart?.();
+            if (chart) return { chart, pathUsed: 'tradingview_api' };
+          } catch (error) {
+            warnings.push('TradingViewApi chart lookup failed: ' + (error?.message || String(error)));
+          }
+          try {
+            const chart = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.activeChart?.()
+              || window._exposed_chartWidgetCollection?.activeChartWidget?._value?.activeChart?.();
+            if (chart) return { chart, pathUsed: 'active_chart_widget' };
+          } catch (error) {
+            warnings.push('Active widget chart lookup failed: ' + (error?.message || String(error)));
+          }
+          return { chart: null, pathUsed: 'none' };
+        };
 
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart && chart.createShape) {
-            const shapeId = chart.createShape(
-              { price: price },
-              {
-                shape: 'horizontal_line',
-                overrides: {
-                  linecolor: color,
-                  linestyle: lineStyle,
-                  linewidth: 2,
-                  showLabel: !!label,
-                  text: label
-                }
-              }
-            );
-            return { success: true, shapeId, price, color, label, method: 'api' };
+          const { chart, pathUsed } = getChart();
+          if (!chart?.createShape) {
+            return { success: false, pathUsed, warnings, hint: 'Chart API not available for drawing' };
           }
-        } catch (e) {
-          return { success: false, error: e.message };
-        }
 
-        return { success: false, hint: 'Chart API not available for drawing' };
+          const before = chart.getAllShapes?.() || [];
+          const shapeId = chart.createShape(
+            { price },
+            {
+              shape: 'horizontal_line',
+              overrides: {
+                linecolor: color,
+                linestyle: lineStyle,
+                linewidth: 2,
+                showLabel: !!label,
+                text: label,
+              },
+            },
+          );
+          const after = chart.getAllShapes?.() || [];
+
+          return {
+            success: true,
+            shapeId,
+            price,
+            color,
+            label,
+            pathUsed,
+            countBefore: before.length,
+            countAfter: after.length,
+            warnings,
+          };
+        } catch (error) {
+          return { success: false, pathUsed: 'none', warnings, error: error?.message || String(error) };
+        }
       })();`, tabId);
 
       return textResult(JSON.stringify(result, null, 2));
@@ -91,22 +122,44 @@ export const drawingTools: ToolDefinition[] = [
       const tabId = await requireTvTab();
 
       const drawings = await evaluate(`(() => {
+        const warnings = [];
+        const getChart = () => {
+          try {
+            const chart = window.TradingViewApi?.activeChart?.();
+            if (chart) return { chart, pathUsed: 'tradingview_api' };
+          } catch (error) {
+            warnings.push('TradingViewApi chart lookup failed: ' + (error?.message || String(error)));
+          }
+          try {
+            const chart = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.activeChart?.()
+              || window._exposed_chartWidgetCollection?.activeChartWidget?._value?.activeChart?.();
+            if (chart) return { chart, pathUsed: 'active_chart_widget' };
+          } catch (error) {
+            warnings.push('Active widget chart lookup failed: ' + (error?.message || String(error)));
+          }
+          return { chart: null, pathUsed: 'none' };
+        };
+
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (!chart) return { error: 'Chart API not available' };
+          const { chart, pathUsed } = getChart();
+          if (!chart?.getAllShapes) {
+            return { drawings: [], count: 0, pathUsed, warnings, error: 'Chart drawing API not available' };
+          }
 
           const shapes = chart.getAllShapes?.() || [];
           return {
-            drawings: shapes.map(s => ({
-              id: s.id,
-              name: s.name || s.type || '',
-              type: s.type || ''
+            drawings: shapes.map((shape, index) => ({
+              index,
+              id: shape?.id ?? null,
+              name: shape?.name || shape?.type || '',
+              type: shape?.type || '',
             })),
             count: shapes.length,
-            source: 'api'
+            pathUsed,
+            warnings,
           };
-        } catch (e) {
-          return { error: e.message };
+        } catch (error) {
+          return { drawings: [], count: 0, pathUsed: 'none', warnings, error: error?.message || String(error) };
         }
       })();`, tabId);
 
@@ -126,16 +179,43 @@ export const drawingTools: ToolDefinition[] = [
       const tabId = await requireTvTab();
 
       const result = await evaluate(`(() => {
-        try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart && chart.removeAllShapes) {
-            chart.removeAllShapes();
-            return { success: true, method: 'api' };
+        const warnings = [];
+        const getChart = () => {
+          try {
+            const chart = window.TradingViewApi?.activeChart?.();
+            if (chart) return { chart, pathUsed: 'tradingview_api' };
+          } catch (error) {
+            warnings.push('TradingViewApi chart lookup failed: ' + (error?.message || String(error)));
           }
-        } catch (e) {
-          return { success: false, error: e.message };
+          try {
+            const chart = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.activeChart?.()
+              || window._exposed_chartWidgetCollection?.activeChartWidget?._value?.activeChart?.();
+            if (chart) return { chart, pathUsed: 'active_chart_widget' };
+          } catch (error) {
+            warnings.push('Active widget chart lookup failed: ' + (error?.message || String(error)));
+          }
+          return { chart: null, pathUsed: 'none' };
+        };
+
+        try {
+          const { chart, pathUsed } = getChart();
+          if (chart?.removeAllShapes) {
+            const before = chart.getAllShapes?.() || [];
+            chart.removeAllShapes();
+            const after = chart.getAllShapes?.() || [];
+            return { success: true, pathUsed, countBefore: before.length, countAfter: after.length, warnings };
+          }
+
+          const action = window._exposed_chartWidgetCollection?.activeChartWidget?._value?._actions?.paneRemoveAllDrawingTools;
+          if (action?.execute) {
+            action.execute();
+            return { success: true, pathUsed: 'action:paneRemoveAllDrawingTools', warnings };
+          }
+
+          return { success: false, pathUsed, warnings, hint: 'Chart drawing clear API not available' };
+        } catch (error) {
+          return { success: false, pathUsed: 'none', warnings, error: error?.message || String(error) };
         }
-        return { success: false, hint: 'Chart API not available' };
       })();`, tabId);
 
       return textResult(JSON.stringify(result, null, 2));

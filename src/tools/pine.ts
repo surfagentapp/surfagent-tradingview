@@ -27,27 +27,43 @@ export const pineTools: ToolDefinition[] = [
     handler: async () => {
       const tabId = await requireTvTab();
 
-      const result = await evaluate(`(() => {
-        // Try clicking the Pine Editor tab
-        try {
-          const tabs = Array.from(document.querySelectorAll('[class*="tabs"] button, [data-name="pine-editor"]'));
-          const pineTab = tabs.find(t => (t.textContent || '').toLowerCase().includes('pine'));
-          if (pineTab) {
-            pineTab.click();
-            return { opened: true, method: 'tab_click' };
+      const result = await evaluate(`(async () => {
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const click = (selector) => {
+          const el = document.querySelector(selector);
+          if (el instanceof HTMLElement) {
+            el.click();
+            return true;
           }
-        } catch {}
+          return false;
+        };
 
-        // Try the bottom panel toggle
-        try {
-          const toggle = document.querySelector('[data-name="pine-editor-toggle"]');
-          if (toggle) {
-            toggle.click();
-            return { opened: true, method: 'toggle' };
-          }
-        } catch {}
+        if (document.querySelector('[data-name="pine-dialog"]')) {
+          return {
+            opened: true,
+            method: 'already_open',
+            dialogVisible: true,
+            hasEditorTextarea: !!document.querySelector('[data-name="pine-dialog"] textarea[aria-label*="Editor content"], [data-name="pine-dialog"] textarea.inputarea, textarea.inputarea'),
+          };
+        }
 
-        return { opened: false, hint: 'Pine Editor tab not found. It may already be open or the layout may differ.' };
+        let method = 'none';
+        if (click('[data-name="pine-dialog-button"]')) {
+          method = 'data-name:pine-dialog-button';
+        } else if (click('[aria-label="Pine"]')) {
+          method = 'aria:Pine';
+        } else if (click('[data-name="pine-editor-toggle"]')) {
+          method = 'data-name:pine-editor-toggle';
+        }
+
+        await wait(300);
+        const dialog = document.querySelector('[data-name="pine-dialog"]');
+        return {
+          opened: !!dialog,
+          method,
+          dialogVisible: !!dialog,
+          hasEditorTextarea: !!document.querySelector('[data-name="pine-dialog"] textarea[aria-label*="Editor content"], [data-name="pine-dialog"] textarea.inputarea, textarea.inputarea'),
+        };
       })();`, tabId);
 
       return textResult(JSON.stringify(result, null, 2));
@@ -57,7 +73,7 @@ export const pineTools: ToolDefinition[] = [
   {
     name: "tv_pine_set_source",
     description:
-      "Set the Pine Script source code in the editor. Replaces all existing code. Call tv_pine_open_editor first.",
+      "Set the Pine Script source code in the visible TradingView Pine editor textarea. This is a DOM-backed editor operation, not a native Pine API.",
     inputSchema: {
       type: "object",
       properties: {
@@ -72,48 +88,56 @@ export const pineTools: ToolDefinition[] = [
     handler: async (args) => {
       const input = asObject(args, "tv_pine_set_source arguments");
       const code = asString(input.code, "code");
+      const encodedCode = Buffer.from(code, "utf8").toString("base64");
       const tabId = await requireTvTab();
 
-      const result = await evaluate(`(() => {
-        const code = ${JSON.stringify(code)};
-
-        // Find the CodeMirror / Monaco editor instance
-        try {
-          // TradingView uses their own editor based on CodeMirror
-          const editorEl = document.querySelector('[class*="pine-editor"] .view-lines, [class*="pine-editor"] .CodeMirror');
-
-          // Try CodeMirror API
-          const cm = editorEl?.closest('.CodeMirror')?.CodeMirror;
-          if (cm) {
-            cm.setValue(code);
-            return { success: true, method: 'codemirror', lines: code.split('\\n').length };
+      const result = await evaluate(`(async () => {
+        const code = (() => {
+          const encoded = ${JSON.stringify(encodedCode)};
+          const binary = atob(encoded);
+          const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+          return new TextDecoder().decode(bytes);
+        })();
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const click = (selector) => {
+          const el = document.querySelector(selector);
+          if (el instanceof HTMLElement) {
+            el.click();
+            return true;
           }
-        } catch {}
+          return false;
+        };
 
-        // Try Monaco editor
+        if (!document.querySelector('[data-name="pine-dialog"]')) {
+          click('[data-name="pine-dialog-button"]');
+          await wait(250);
+        }
+
+        const textarea = document.querySelector('[data-name="pine-dialog"] textarea[aria-label*="Editor content"], [data-name="pine-dialog"] textarea.inputarea, textarea.inputarea');
+        if (!(textarea instanceof HTMLTextAreaElement)) {
+          return { success: false, method: 'none', hint: 'Could not find Pine editor textarea. Make sure the editor is open.' };
+        }
+
+        textarea.focus();
+        textarea.select();
+        let method = 'execCommand:insertText';
         try {
-          const monacoEditors = window.monaco?.editor?.getEditors?.() || [];
-          if (monacoEditors.length > 0) {
-            monacoEditors[0].setValue(code);
-            return { success: true, method: 'monaco', lines: code.split('\\n').length };
-          }
-        } catch {}
+          document.execCommand('insertText', false, code);
+        } catch {
+          method = 'setRangeText';
+          textarea.setSelectionRange(0, textarea.value.length);
+          textarea.setRangeText(code, 0, textarea.value.length, 'end');
+        }
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        await wait(500);
 
-        // Try textarea fallback
-        try {
-          const textarea = document.querySelector('[class*="pine-editor"] textarea');
-          if (textarea) {
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-            if (!nativeInputValueSetter) {
-              throw new Error('Textarea value setter not available');
-            }
-            nativeInputValueSetter.call(textarea, code);
-            textarea.dispatchEvent(new Event('input', { bubbles: true }));
-            return { success: true, method: 'textarea', lines: code.split('\\n').length };
-          }
-        } catch {}
-
-        return { success: false, hint: 'Could not find Pine Script editor. Make sure it is open (use tv_pine_open_editor).' };
+        return {
+          success: textarea.value === code,
+          method,
+          lines: code.split('\\n').length,
+          chars: code.length,
+          verifiedLength: textarea.value.length,
+        };
       })();`, tabId);
 
       return textResult(JSON.stringify(result, null, 2));
@@ -123,7 +147,7 @@ export const pineTools: ToolDefinition[] = [
   {
     name: "tv_pine_compile",
     description:
-      "Compile (Add to Chart) the current Pine Script in the editor. Returns compilation status.",
+      "Trigger the visible Pine editor's Add to chart or Update on chart action. This reports whether the UI action was triggered, not whether TradingView accepted the script cleanly.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -132,22 +156,58 @@ export const pineTools: ToolDefinition[] = [
     handler: async () => {
       const tabId = await requireTvTab();
 
-      const result = await evaluate(`(() => {
-        // Click "Add to Chart" button
-        try {
-          const buttons = Array.from(document.querySelectorAll('[class*="pine-editor"] button, [class*="scriptEditor"] button'));
-          const addBtn = buttons.find(b => {
-            const text = (b.textContent || '').toLowerCase();
-            return text.includes('add to chart') || text.includes('apply') || text.includes('update');
-          });
-
-          if (addBtn) {
-            addBtn.click();
-            return { triggered: true, method: 'button_click', note: 'Compilation triggered. Check for errors in the editor output.' };
+      const result = await evaluate(`(async () => {
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const click = (selector) => {
+          const el = document.querySelector(selector);
+          if (el instanceof HTMLElement) {
+            el.click();
+            return true;
           }
-        } catch {}
+          return false;
+        };
+        const text = (el) => (el?.textContent || '').trim().replace(/\s+/g, ' ').toLowerCase();
 
-        return { triggered: false, hint: 'Could not find the compile/add button. The Pine Editor may not be open.' };
+        if (!document.querySelector('[data-name="pine-dialog"]')) {
+          click('[data-name="pine-dialog-button"]');
+          await wait(250);
+        }
+
+        let method = 'none';
+        const buttons = Array.from(document.querySelectorAll('[data-name="pine-dialog"] button, [data-name="pine-dialog"] [role="button"], button[title="Add to chart"], button[title="Update on chart"], [aria-label="Add to chart"], [aria-label="Update on chart"]'));
+        const compileButton = buttons.find((button) => {
+          const hay = [text(button), button.getAttribute('aria-label') || '', button.getAttribute('title') || '', button.getAttribute('data-name') || ''].join(' ').toLowerCase();
+          return hay.includes('add to chart') || hay.includes('update on chart') || hay.includes('apply') || hay.includes('compile');
+        });
+        if (compileButton instanceof HTMLElement) {
+          compileButton.click();
+          method = 'button';
+        }
+
+        if (method === 'none') {
+          const textarea = document.querySelector('[data-name="pine-dialog"] textarea[aria-label*="Editor content"], textarea.inputarea');
+          if (textarea instanceof HTMLTextAreaElement) {
+            textarea.focus();
+            for (const eventType of ['keydown', 'keyup']) {
+              textarea.dispatchEvent(new KeyboardEvent(eventType, { key: 'Enter', code: 'Enter', ctrlKey: true, metaKey: true, bubbles: true }));
+            }
+            method = 'keyboard:ctrl+enter';
+          }
+        }
+
+        await wait(500);
+        const root = document.querySelector('[data-name="pine-dialog"]') || document;
+        const errorEls = Array.from(root.querySelectorAll('[role="alert"], [title="Compilation error"], [class*="error"], [class*="notification"], [class*="message"], [class*="problems"]'));
+        const errors = errorEls
+          .map((el) => (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 300))
+          .filter(Boolean);
+
+        return {
+          triggered: method !== 'none',
+          method,
+          errorCount: errors.length,
+          errors,
+        };
       })();`, tabId);
 
       return textResult(JSON.stringify(result, null, 2));
@@ -157,7 +217,7 @@ export const pineTools: ToolDefinition[] = [
   {
     name: "tv_pine_get_errors",
     description:
-      "Get any compilation errors from the Pine Script editor.",
+      "Read the currently visible Pine editor messages, warnings, and error badges. This reflects visible UI state, which may include stale messages if TradingView has not cleared them yet.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -167,22 +227,26 @@ export const pineTools: ToolDefinition[] = [
       const tabId = await requireTvTab();
 
       const result = await evaluate(`(() => {
+        const text = (el) => (el?.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 500);
         try {
-          // Look for error messages in the Pine editor output
-          const errorEls = document.querySelectorAll('[class*="pine-editor"] [class*="error"], [class*="scriptEditor"] [class*="error"], [class*="consoleRow"]');
-          const errors = Array.from(errorEls).map(el => ({
-            text: (el.textContent || '').trim().slice(0, 500),
-            type: el.classList.toString().includes('error') ? 'error' : 'info'
-          })).filter(e => e.text);
+          const root = document.querySelector('[data-name="pine-dialog"]') || document;
+          const errorEls = Array.from(root.querySelectorAll('[role="alert"], [title="Compilation error"], [class*="error"], [class*="notification"], [class*="message"], [class*="problems"]'));
+          const errors = errorEls
+            .map((el) => ({
+              text: text(el),
+              type: el.className.toString().toLowerCase().includes('error') ? 'error' : 'info',
+            }))
+            .filter((entry) => entry.text);
 
           return {
             errors,
-            hasErrors: errors.some(e => e.type === 'error'),
-            count: errors.length
+            hasErrors: errors.some((entry) => entry.type === 'error'),
+            count: errors.length,
+            dialogVisible: !!document.querySelector('[data-name="pine-dialog"]'),
           };
-        } catch {}
-
-        return { errors: [], hasErrors: false, count: 0, note: 'Could not read editor output' };
+        } catch (error) {
+          return { errors: [], hasErrors: false, count: 0, dialogVisible: false, note: error?.message || String(error) };
+        }
       })();`, tabId);
 
       return textResult(JSON.stringify(result, null, 2));
