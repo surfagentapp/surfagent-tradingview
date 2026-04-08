@@ -6,93 +6,65 @@
 
 import type { ToolDefinition } from "../types.js";
 import { asObject, asOptionalNumber, textResult } from "../types.js";
-import { evaluate, findTradingViewTab } from "../connection.js";
-
-async function requireTvTab(): Promise<string> {
-  const tab = await findTradingViewTab();
-  if (!tab) throw new Error("TradingView is not open. Use tv_open first.");
-  return tab.id;
-}
+import { evaluate } from "../connection.js";
+import { getLivePageState, requireTradingViewTab } from "./live-page.js";
 
 export const dataTools: ToolDefinition[] = [
   {
     name: "tv_quote",
     description:
-      "Get the current real-time quote for the active chart symbol: price, change, volume, bid/ask, high/low.",
+      "Get the current quote for the active chart symbol. Returns structured OHLCV data when the live chart API is available, otherwise a degraded DOM-derived quote with warnings.",
     inputSchema: {
       type: "object",
       properties: {},
       additionalProperties: false,
     },
     handler: async () => {
-      const tabId = await requireTvTab();
+      const tabId = await requireTradingViewTab();
+      const state = await getLivePageState(tabId);
+
+      if (state.lastBar) {
+        return textResult(JSON.stringify({
+          symbol: state.symbol,
+          interval: state.interval,
+          exchange: state.exchange,
+          ...state.lastBar,
+          pathUsed: state.pathUsed,
+          warnings: state.warnings,
+        }, null, 2));
+      }
 
       const quote = await evaluate(`(() => {
-        // Try widget API
+        const warnings = [];
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart) {
-            const symbol = chart.symbol?.() || '';
-            const resolution = chart.resolution?.() || '';
-
-            // Get last bar data
-            const series = chart.getSeries?.();
-            if (series) {
-              const bars = series.bars?.();
-              const lastBar = bars?.last?.();
-              if (lastBar) {
-                return {
-                  symbol,
-                  resolution,
-                  open: lastBar.open,
-                  high: lastBar.high,
-                  low: lastBar.low,
-                  close: lastBar.close,
-                  volume: lastBar.volume,
-                  time: lastBar.time,
-                  source: 'series_api'
-                };
-              }
-            }
-          }
-        } catch {}
-
-        // DOM scraping fallback — get price from the legend/header
-        try {
-          // Price from the chart header
-          const priceEl = document.querySelector('[class*="lastPrice"], [class*="quote-last"]');
+          const priceEl = document.querySelector('[class*="lastPrice"], [class*="quote-last"], [data-name="legend-last-value"]');
           const changeEl = document.querySelector('[class*="change"], [class*="quoteChange"]');
-          const symbolEl = document.querySelector('[data-symbol-short]');
+          const symbolEl = document.querySelector('[data-symbol-short], [data-name="legend-source-item"]');
 
           const price = priceEl?.textContent?.trim() || null;
           const change = changeEl?.textContent?.trim() || null;
-          const symbol = symbolEl?.textContent?.trim() || symbolEl?.getAttribute('data-symbol-short') || null;
+          const symbol = symbolEl?.getAttribute?.('data-symbol-short') || symbolEl?.textContent?.trim() || null;
 
           if (price) {
-            return { symbol, price, change, source: 'dom' };
+            warnings.push('Quote derived from DOM, not live chart API. Fields may be partial or formatted strings.');
+            return { symbol, price, change, pathUsed: 'dom', warnings };
           }
-        } catch {}
+        } catch (error) {
+          warnings.push('DOM quote lookup failed: ' + (error?.message || String(error)));
+        }
 
-        // Last resort: scrape the legend values
-        try {
-          const legendValues = Array.from(document.querySelectorAll('[class*="valuesAdditionalWrapper"] span, [class*="legendValues"] span'));
-          const values = legendValues.map(el => el.textContent?.trim()).filter(Boolean);
-          if (values.length >= 4) {
-            return {
-              open: values[0],
-              high: values[1],
-              low: values[2],
-              close: values[3],
-              volume: values[4] || null,
-              source: 'legend_dom'
-            };
-          }
-        } catch {}
-
-        return { error: 'Could not extract quote data', source: 'none' };
+        warnings.push('Could not extract quote data.');
+        return { error: 'Could not extract quote data', pathUsed: 'none', warnings };
       })();`, tabId);
 
-      return textResult(JSON.stringify(quote, null, 2));
+      return textResult(JSON.stringify({
+        symbol: state.symbol,
+        interval: state.interval,
+        exchange: state.exchange,
+        diagnostics: state.diagnostics,
+        ...((quote as Record<string, unknown>) ?? {}),
+        warnings: [...state.warnings, ...((((quote as Record<string, unknown>)?.warnings as string[] | undefined) ?? []))],
+      }, null, 2));
     },
   },
 
@@ -125,14 +97,15 @@ export const dataTools: ToolDefinition[] = [
       if (!["full", "summary"].includes(format)) {
         throw new Error("format must be either 'full' or 'summary'.");
       }
-      const tabId = await requireTvTab();
+      const tabId = await requireTradingViewTab();
 
       const data = await evaluate(`(() => {
         const numBars = ${numBars};
         const format = ${JSON.stringify(format)};
 
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
+          const api = window.TradingViewApi;
+          const chart = api?.activeChart?.() || window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
           if (!chart) return { error: 'Chart API not available' };
 
           const series = chart.getSeries?.();
@@ -141,7 +114,6 @@ export const dataTools: ToolDefinition[] = [
           const allBars = series.bars?.();
           if (!allBars) return { error: 'Bars not available' };
 
-          // Get the last N bars
           const barCount = allBars.size?.() || 0;
           const startIdx = Math.max(0, barCount - numBars);
           const bars = [];
@@ -210,11 +182,12 @@ export const dataTools: ToolDefinition[] = [
       additionalProperties: false,
     },
     handler: async () => {
-      const tabId = await requireTvTab();
+      const tabId = await requireTradingViewTab();
 
       const indicators = await evaluate(`(() => {
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
+          const api = window.TradingViewApi;
+          const chart = api?.activeChart?.() || window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
           if (!chart) return { error: 'Chart API not available' };
 
           const studies = chart.getAllStudies?.() || [];
@@ -226,7 +199,6 @@ export const dataTools: ToolDefinition[] = [
               visible: true
             };
 
-            // Try to get current values
             try {
               const source = chart.getStudyById?.(study.id);
               if (source) {
@@ -243,7 +215,6 @@ export const dataTools: ToolDefinition[] = [
           return { indicators: result, count: result.length, source: 'api' };
         } catch {}
 
-        // DOM fallback
         try {
           const legends = Array.from(document.querySelectorAll('[class*="sourcesWrapper"] [class*="sources"]'));
           const result = legends.map((el, i) => ({
@@ -284,13 +255,14 @@ export const dataTools: ToolDefinition[] = [
       if (!studyName) {
         throw new Error("studyName must be a non-empty string.");
       }
-      const tabId = await requireTvTab();
+      const tabId = await requireTradingViewTab();
 
       const result = await evaluate(`(() => {
         const needle = ${JSON.stringify(studyName)}.toLowerCase();
 
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
+          const api = window.TradingViewApi;
+          const chart = api?.activeChart?.() || window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
           if (!chart) return { error: 'Chart API not available' };
 
           const studies = chart.getAllStudies?.() || [];
@@ -321,7 +293,6 @@ export const dataTools: ToolDefinition[] = [
           };
         } catch {}
 
-        // DOM fallback
         try {
           const legends = Array.from(document.querySelectorAll('[class*="sourcesWrapper"] [class*="sources"]'));
           const match = legends.find(el => {

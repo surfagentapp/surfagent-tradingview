@@ -21026,10 +21026,159 @@ function asOptionalNumber(value) {
 
 // src/tools/health.ts
 init_connection();
+
+// src/tools/live-page.ts
+init_connection();
+async function requireTradingViewTab() {
+  const tab = await findTradingViewTab();
+  if (!tab) {
+    throw new Error("TradingView is not open. Use tv_open first.");
+  }
+  return tab.id;
+}
+var LIVE_PAGE_STATE_SCRIPT = `(() => {
+  const w = window;
+  const warnings = [];
+  const diagnostics = {
+    tradingViewApi: !!w.TradingViewApi,
+    widgetCollection: !!w._exposed_chartWidgetCollection,
+    activeChart: false,
+    getSymbolInterval: false,
+    domSymbol: false,
+    domInterval: false,
+  };
+
+  const out = {
+    ready: false,
+    symbol: null,
+    interval: null,
+    chartType: null,
+    exchange: null,
+    indicators: [],
+    lastBar: null,
+    url: w.location.href,
+    title: document.title,
+    hasWidget: !!(w.TradingViewApi || w.TradingView || w.tvWidget || document.querySelector('.chart-container, .layout__area--center')),
+    hasApi: false,
+    pathUsed: 'none',
+    warnings,
+    diagnostics,
+  };
+
+  const safeValue = (value) => {
+    if (value == null) return null;
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
+    try { return JSON.parse(JSON.stringify(value)); } catch { return String(value); }
+  };
+
+  const collectFromChart = (chart, pathUsed) => {
+    if (!chart) return false;
+    diagnostics.activeChart = true;
+    out.hasApi = true;
+    out.pathUsed = pathUsed;
+
+    try { out.symbol = safeValue(chart.symbol?.()) || out.symbol; } catch {}
+    try { out.interval = safeValue(chart.resolution?.()) || out.interval; } catch {}
+    try { out.chartType = safeValue(chart.chartType?.()) || out.chartType; } catch {}
+    try {
+      const ext = chart.symbolExt?.() || {};
+      out.exchange = safeValue(ext.exchange || ext.listed_exchange) || out.exchange;
+    } catch {}
+    try {
+      const studies = chart.getAllStudies?.() || [];
+      out.indicators = studies.map((study) => ({
+        id: safeValue(study?.id),
+        name: safeValue(study?.name || study?.title || ''),
+        type: safeValue(study?.type || ''),
+      }));
+    } catch {}
+    try {
+      const series = chart.getSeries?.();
+      const bars = series?.bars?.();
+      const lastBar = bars?.last?.();
+      if (lastBar) {
+        out.lastBar = {
+          time: safeValue(lastBar.time),
+          open: safeValue(lastBar.open),
+          high: safeValue(lastBar.high),
+          low: safeValue(lastBar.low),
+          close: safeValue(lastBar.close),
+          volume: safeValue(lastBar.volume),
+        };
+      }
+    } catch {}
+    return true;
+  };
+
+  try {
+    const api = w.TradingViewApi;
+    const chart = api?.activeChart?.();
+    if (chart) {
+      collectFromChart(chart, 'tradingview_api');
+      try {
+        const symbolInterval = api?.getSymbolInterval?.();
+        if (symbolInterval) {
+          diagnostics.getSymbolInterval = true;
+          out.symbol = safeValue(symbolInterval.symbol) || out.symbol;
+          out.interval = safeValue(symbolInterval.interval) || out.interval;
+        }
+      } catch {}
+    }
+  } catch (error) {
+    warnings.push('TradingViewApi lookup failed: ' + (error?.message || String(error)));
+  }
+
+  if (out.pathUsed === 'none') {
+    try {
+      const chart = w._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
+      if (chart) {
+        collectFromChart(chart, 'widget_collection');
+      }
+    } catch (error) {
+      warnings.push('Widget collection lookup failed: ' + (error?.message || String(error)));
+    }
+  }
+
+  if (!out.symbol) {
+    try {
+      const symbolEl = document.querySelector('[data-symbol-short], [data-name="legend-source-item"] [title], [data-name="legend-source-item"]');
+      const symbol = symbolEl?.getAttribute?.('data-symbol-short') || symbolEl?.getAttribute?.('title') || symbolEl?.textContent?.trim() || null;
+      if (symbol) {
+        diagnostics.domSymbol = true;
+        out.symbol = symbol;
+        if (out.pathUsed === 'none') out.pathUsed = 'dom';
+      }
+    } catch {}
+  }
+
+  if (!out.interval) {
+    try {
+      const intervalEl = document.querySelector('[data-value][class*="isActive"], button[data-value][aria-pressed="true"], [data-name="header-intervals"] button[aria-pressed="true"]');
+      const interval = intervalEl?.getAttribute?.('data-value') || intervalEl?.textContent?.trim() || null;
+      if (interval) {
+        diagnostics.domInterval = true;
+        out.interval = interval;
+        if (out.pathUsed === 'none') out.pathUsed = 'dom';
+      }
+    } catch {}
+  }
+
+  if (!out.symbol) warnings.push('Active symbol could not be resolved.');
+  if (!out.interval) warnings.push('Active interval could not be resolved.');
+  if (!out.hasApi) warnings.push('TradingView chart API not detected; DOM fallbacks may be stale.');
+
+  out.ready = !!(out.symbol && out.interval);
+  return out;
+})();`;
+async function getLivePageState(tabId) {
+  return await evaluate(LIVE_PAGE_STATE_SCRIPT, tabId);
+}
+
+// src/tools/health.ts
 var healthTools = [
   {
     name: "tv_health_check",
-    description: "Check if TradingView is open in the SurfAgent browser and the chart widget is accessible. Returns status, URL, symbol info, and chart readiness.",
+    description: "Check if TradingView is open in the SurfAgent browser and whether the live chart page is actually readable. Returns status, URL, symbol info, readiness, and lightweight diagnostics.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -21046,52 +21195,22 @@ var healthTools = [
           }, null, 2)
         );
       }
-      const state = await evaluate(`(() => {
-        const w = window;
-        const hasWidget = !!(w.TradingView || w.tvWidget || document.querySelector('.chart-container, .layout__area--center'));
-        const hasApi = !!(w._exposed_chartWidgetCollection || w.TradingView?.activeChart);
-
-        // Try to get current symbol from various TradingView internal paths
-        let symbol = null;
-        let interval = null;
-        let chartType = null;
-
-        try {
-          // Path 1: Widget API
-          const chart = w._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart) {
-            symbol = chart.symbol?.() || null;
-            interval = chart.resolution?.() || null;
-            chartType = String(chart.chartType?.() || '');
-          }
-        } catch {}
-
-        if (!symbol) {
-          try {
-            // Path 2: DOM scraping
-            const symbolEl = document.querySelector('[data-symbol-short], .chart-controls-bar .apply-common-tooltip');
-            symbol = symbolEl?.textContent?.trim() || null;
-
-            const intervalEl = document.querySelector('[data-value][class*="isActive"], .chart-controls-bar button[class*="isActive"]');
-            interval = intervalEl?.getAttribute('data-value') || intervalEl?.textContent?.trim() || null;
-          } catch {}
-        }
-
-        return {
-          hasWidget,
-          hasApi,
-          symbol,
-          interval,
-          chartType,
-          url: window.location.href,
-          title: document.title,
-        };
-      })();`, tab.id);
+      const state = await getLivePageState(tab.id);
       return textResult(
         JSON.stringify({
-          status: "connected",
+          status: state.ready ? "connected" : "degraded",
           tabId: tab.id,
-          ...state
+          url: state.url,
+          title: state.title,
+          symbol: state.symbol,
+          interval: state.interval,
+          chartType: state.chartType,
+          hasWidget: state.hasWidget,
+          hasApi: state.hasApi,
+          ready: state.ready,
+          pathUsed: state.pathUsed,
+          warnings: state.warnings,
+          diagnostics: state.diagnostics
         }, null, 2)
       );
     }
@@ -21150,73 +21269,6 @@ var healthTools = [
 
 // src/tools/chart.ts
 init_connection();
-async function requireTvTab() {
-  const tab = await findTradingViewTab();
-  if (!tab) {
-    throw new Error("TradingView is not open. Use tv_open first.");
-  }
-  return tab.id;
-}
-var GET_CHART_STATE = `(() => {
-  const w = window;
-  let symbol = null, interval = null, chartType = null, exchange = null;
-  let indicators = [], drawings = [];
-
-  // Try internal widget API first
-  try {
-    const collection = w._exposed_chartWidgetCollection;
-    const widget = collection?.getActive?.();
-    const chart = widget?.activeChart?.();
-    if (chart) {
-      symbol = chart.symbol?.() || null;
-      interval = chart.resolution?.() || null;
-      chartType = String(chart.chartType?.() || '');
-
-      // Get studies/indicators
-      try {
-        const studies = chart.getAllStudies?.() || [];
-        indicators = studies.map(s => ({
-          id: s.id,
-          name: s.name || s.title || '',
-          type: s.type || ''
-        }));
-      } catch {}
-
-      // Get exchange from symbol info
-      try {
-        const info = chart.symbolExt?.() || {};
-        exchange = info.exchange || info.listed_exchange || null;
-      } catch {}
-    }
-  } catch {}
-
-  // DOM fallback for symbol
-  if (!symbol) {
-    try {
-      const el = document.querySelector('[data-symbol-short]');
-      symbol = el?.getAttribute('data-symbol-short') || el?.textContent?.trim() || null;
-    } catch {}
-  }
-
-  // DOM fallback for interval
-  if (!interval) {
-    try {
-      const el = document.querySelector('[data-value][class*="isActive"]');
-      interval = el?.getAttribute('data-value') || el?.textContent?.trim() || null;
-    } catch {}
-  }
-
-  return {
-    symbol,
-    exchange,
-    interval,
-    chartType,
-    indicators,
-    drawingCount: drawings.length,
-    url: window.location.href,
-    ready: !!(symbol && interval)
-  };
-})();`;
 var chartTools = [
   {
     name: "tv_chart_state",
@@ -21227,9 +21279,22 @@ var chartTools = [
       additionalProperties: false
     },
     handler: async () => {
-      const tabId = await requireTvTab();
-      const state = await evaluate(GET_CHART_STATE, tabId);
-      return textResult(JSON.stringify(state, null, 2));
+      const tabId = await requireTradingViewTab();
+      const state = await getLivePageState(tabId);
+      return textResult(JSON.stringify({
+        symbol: state.symbol,
+        exchange: state.exchange,
+        interval: state.interval,
+        chartType: state.chartType,
+        indicators: state.indicators,
+        drawingCount: null,
+        lastBar: state.lastBar,
+        url: state.url,
+        ready: state.ready,
+        pathUsed: state.pathUsed,
+        warnings: state.warnings,
+        diagnostics: state.diagnostics
+      }, null, 2));
     }
   },
   {
@@ -21248,23 +21313,29 @@ var chartTools = [
       const input = asObject(args, "tv_set_symbol arguments");
       const symbol2 = asString(input.symbol, "symbol");
       const exchange = asOptionalString(input.exchange);
-      const tabId = await requireTvTab();
+      const tabId = await requireTradingViewTab();
       const fullSymbol = exchange ? `${exchange}:${symbol2}` : symbol2;
       const result = await evaluate(`(() => {
         const fullSymbol = ${JSON.stringify(fullSymbol)};
 
-        // Method 1: Widget API
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart && chart.setSymbol) {
+          const api = window.TradingViewApi;
+          const chart = api?.activeChart?.();
+          if (chart?.setSymbol) {
             chart.setSymbol(fullSymbol);
-            return { method: 'api', symbol: fullSymbol, success: true };
+            return { method: 'tradingview_api', symbol: fullSymbol, success: true };
           }
         } catch {}
 
-        // Method 2: Search box interaction
         try {
-          // Open symbol search
+          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
+          if (chart?.setSymbol) {
+            chart.setSymbol(fullSymbol);
+            return { method: 'widget_collection', symbol: fullSymbol, success: true };
+          }
+        } catch {}
+
+        try {
           const searchBtn = document.querySelector('[data-name="legend-source-item"] button, [aria-label="Symbol Search"]');
           if (searchBtn) {
             searchBtn.click();
@@ -21272,13 +21343,12 @@ var chartTools = [
           }
         } catch {}
 
-        // Method 3: URL navigation
         return { method: 'url', symbol: fullSymbol, success: false, hint: 'Will navigate via URL' };
       })();`, tabId);
       const res = result;
       if (!res.success && res.method === "url") {
-        const url2 = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(fullSymbol)}`;
         const { navigateTab: navigateTab2 } = await Promise.resolve().then(() => (init_connection(), connection_exports));
+        const url2 = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(fullSymbol)}`;
         await navigateTab2(url2, tabId);
         await new Promise((r) => setTimeout(r, 2e3));
         return textResult(JSON.stringify({ success: true, symbol: fullSymbol, method: "url_navigate" }, null, 2));
@@ -21288,7 +21358,7 @@ var chartTools = [
   },
   {
     name: "tv_set_timeframe",
-    description: "Change the chart timeframe/interval. Common values: 1, 5, 15, 30, 60, 240, D, W, M (minutes for numbers, D=daily, W=weekly, M=monthly).",
+    description: "Change the chart timeframe/interval. Common values: 1, 5, 15, 30, 60, 240, D, W, M (minutes for numbers, D=daily, W=weekly, M=monthly). Returns whether the requested interval was actually observed after the change.",
     inputSchema: {
       type: "object",
       properties: {
@@ -21303,33 +21373,62 @@ var chartTools = [
       if (!/^(?:[1-9]\d{0,3}|D|W|M)$/.test(interval)) {
         throw new Error("interval must be a TradingView resolution like 1, 5, 15, 60, 240, D, W, or M.");
       }
-      const tabId = await requireTvTab();
-      const result = await evaluate(`(() => {
-        const interval = ${JSON.stringify(interval)};
+      const tabId = await requireTradingViewTab();
+      const attempt = await evaluate(`(() => {
+        const targetInterval = ${JSON.stringify(interval)};
+        const warnings = [];
+        let pathUsed = 'none';
 
-        // Method 1: Widget API
+        try {
+          const api = window.TradingViewApi;
+          const chart = api?.activeChart?.();
+          if (chart?.setResolution) {
+            chart.setResolution(targetInterval);
+            pathUsed = 'tradingview_api';
+            return { accepted: true, requestedInterval: targetInterval, pathUsed, warnings };
+          }
+        } catch (error) {
+          warnings.push('TradingViewApi setResolution failed: ' + (error?.message || String(error)));
+        }
+
         try {
           const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart && chart.setResolution) {
-            chart.setResolution(interval);
-            return { success: true, interval, method: 'api' };
+          if (chart?.setResolution) {
+            chart.setResolution(targetInterval);
+            pathUsed = 'widget_collection';
+            return { accepted: true, requestedInterval: targetInterval, pathUsed, warnings };
           }
-        } catch {}
+        } catch (error) {
+          warnings.push('Widget collection setResolution failed: ' + (error?.message || String(error)));
+        }
 
-        // Method 2: Click the timeframe button in the toolbar
         try {
-          const buttons = Array.from(document.querySelectorAll('[data-value]'));
-          const match = buttons.find(b => b.getAttribute('data-value') === interval);
-          if (match) {
+          const buttons = Array.from(document.querySelectorAll('[data-value], button[data-value]'));
+          const match = buttons.find((button) => button.getAttribute('data-value') === targetInterval || button.textContent?.trim() === targetInterval);
+          if (match instanceof HTMLElement) {
             match.click();
-            return { success: true, interval, method: 'click' };
+            pathUsed = 'dom';
+            return { accepted: true, requestedInterval: targetInterval, pathUsed, warnings };
           }
-        } catch {}
+        } catch (error) {
+          warnings.push('DOM timeframe click failed: ' + (error?.message || String(error)));
+        }
 
-        // Method 3: Keyboard shortcut \u2014 numbers set timeframe in TV
-        return { success: false, interval, hint: 'Could not set timeframe via API or DOM' };
+        warnings.push('Could not find a live TradingView timeframe control.');
+        return { accepted: false, requestedInterval: targetInterval, pathUsed, warnings };
       })();`, tabId);
-      return textResult(JSON.stringify(result, null, 2));
+      await new Promise((r) => setTimeout(r, 500));
+      const state = await getLivePageState(tabId);
+      const success2 = !!attempt.accepted && state.interval === interval;
+      return textResult(JSON.stringify({
+        success: success2,
+        requestedInterval: interval,
+        actualInterval: state.interval,
+        symbol: state.symbol,
+        pathUsed: attempt.pathUsed,
+        verificationPath: state.pathUsed === "tradingview_api" && state.diagnostics.getSymbolInterval ? "getSymbolInterval" : state.pathUsed,
+        warnings: success2 ? attempt.warnings : [...attempt.warnings, `Requested ${interval} but observed ${state.interval ?? "unknown"}.`]
+      }, null, 2));
     }
   },
   {
@@ -21349,7 +21448,7 @@ var chartTools = [
     handler: async (args) => {
       const input = asObject(args, "tv_set_chart_type arguments");
       const chartType = asString(input.chartType, "chartType");
-      const tabId = await requireTvTab();
+      const tabId = await requireTradingViewTab();
       const CHART_TYPE_MAP = {
         bars: 0,
         candles: 1,
@@ -21370,13 +21469,21 @@ var chartTools = [
       }
       const result = await evaluate(`(() => {
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart && chart.setChartType) {
+          const api = window.TradingViewApi;
+          const chart = api?.activeChart?.();
+          if (chart?.setChartType) {
             chart.setChartType(${typeNum});
-            return { success: true, chartType: ${JSON.stringify(chartType)}, method: 'api' };
+            return { success: true, chartType: ${JSON.stringify(chartType)}, pathUsed: 'tradingview_api' };
           }
         } catch {}
-        return { success: false, chartType: ${JSON.stringify(chartType)}, hint: 'Widget API not available' };
+        try {
+          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
+          if (chart?.setChartType) {
+            chart.setChartType(${typeNum});
+            return { success: true, chartType: ${JSON.stringify(chartType)}, pathUsed: 'widget_collection' };
+          }
+        } catch {}
+        return { success: false, chartType: ${JSON.stringify(chartType)}, pathUsed: 'none', hint: 'Chart type API not available' };
       })();`, tabId);
       return textResult(JSON.stringify(result, null, 2));
     }
@@ -21385,87 +21492,58 @@ var chartTools = [
 
 // src/tools/data.ts
 init_connection();
-async function requireTvTab2() {
-  const tab = await findTradingViewTab();
-  if (!tab) throw new Error("TradingView is not open. Use tv_open first.");
-  return tab.id;
-}
 var dataTools = [
   {
     name: "tv_quote",
-    description: "Get the current real-time quote for the active chart symbol: price, change, volume, bid/ask, high/low.",
+    description: "Get the current quote for the active chart symbol. Returns structured OHLCV data when the live chart API is available, otherwise a degraded DOM-derived quote with warnings.",
     inputSchema: {
       type: "object",
       properties: {},
       additionalProperties: false
     },
     handler: async () => {
-      const tabId = await requireTvTab2();
+      const tabId = await requireTradingViewTab();
+      const state = await getLivePageState(tabId);
+      if (state.lastBar) {
+        return textResult(JSON.stringify({
+          symbol: state.symbol,
+          interval: state.interval,
+          exchange: state.exchange,
+          ...state.lastBar,
+          pathUsed: state.pathUsed,
+          warnings: state.warnings
+        }, null, 2));
+      }
       const quote = await evaluate(`(() => {
-        // Try widget API
+        const warnings = [];
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart) {
-            const symbol = chart.symbol?.() || '';
-            const resolution = chart.resolution?.() || '';
-
-            // Get last bar data
-            const series = chart.getSeries?.();
-            if (series) {
-              const bars = series.bars?.();
-              const lastBar = bars?.last?.();
-              if (lastBar) {
-                return {
-                  symbol,
-                  resolution,
-                  open: lastBar.open,
-                  high: lastBar.high,
-                  low: lastBar.low,
-                  close: lastBar.close,
-                  volume: lastBar.volume,
-                  time: lastBar.time,
-                  source: 'series_api'
-                };
-              }
-            }
-          }
-        } catch {}
-
-        // DOM scraping fallback \u2014 get price from the legend/header
-        try {
-          // Price from the chart header
-          const priceEl = document.querySelector('[class*="lastPrice"], [class*="quote-last"]');
+          const priceEl = document.querySelector('[class*="lastPrice"], [class*="quote-last"], [data-name="legend-last-value"]');
           const changeEl = document.querySelector('[class*="change"], [class*="quoteChange"]');
-          const symbolEl = document.querySelector('[data-symbol-short]');
+          const symbolEl = document.querySelector('[data-symbol-short], [data-name="legend-source-item"]');
 
           const price = priceEl?.textContent?.trim() || null;
           const change = changeEl?.textContent?.trim() || null;
-          const symbol = symbolEl?.textContent?.trim() || symbolEl?.getAttribute('data-symbol-short') || null;
+          const symbol = symbolEl?.getAttribute?.('data-symbol-short') || symbolEl?.textContent?.trim() || null;
 
           if (price) {
-            return { symbol, price, change, source: 'dom' };
+            warnings.push('Quote derived from DOM, not live chart API. Fields may be partial or formatted strings.');
+            return { symbol, price, change, pathUsed: 'dom', warnings };
           }
-        } catch {}
+        } catch (error) {
+          warnings.push('DOM quote lookup failed: ' + (error?.message || String(error)));
+        }
 
-        // Last resort: scrape the legend values
-        try {
-          const legendValues = Array.from(document.querySelectorAll('[class*="valuesAdditionalWrapper"] span, [class*="legendValues"] span'));
-          const values = legendValues.map(el => el.textContent?.trim()).filter(Boolean);
-          if (values.length >= 4) {
-            return {
-              open: values[0],
-              high: values[1],
-              low: values[2],
-              close: values[3],
-              volume: values[4] || null,
-              source: 'legend_dom'
-            };
-          }
-        } catch {}
-
-        return { error: 'Could not extract quote data', source: 'none' };
+        warnings.push('Could not extract quote data.');
+        return { error: 'Could not extract quote data', pathUsed: 'none', warnings };
       })();`, tabId);
-      return textResult(JSON.stringify(quote, null, 2));
+      return textResult(JSON.stringify({
+        symbol: state.symbol,
+        interval: state.interval,
+        exchange: state.exchange,
+        diagnostics: state.diagnostics,
+        ...quote ?? {},
+        warnings: [...state.warnings, ...quote?.warnings ?? []]
+      }, null, 2));
     }
   },
   {
@@ -21496,13 +21574,14 @@ var dataTools = [
       if (!["full", "summary"].includes(format)) {
         throw new Error("format must be either 'full' or 'summary'.");
       }
-      const tabId = await requireTvTab2();
+      const tabId = await requireTradingViewTab();
       const data = await evaluate(`(() => {
         const numBars = ${numBars};
         const format = ${JSON.stringify(format)};
 
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
+          const api = window.TradingViewApi;
+          const chart = api?.activeChart?.() || window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
           if (!chart) return { error: 'Chart API not available' };
 
           const series = chart.getSeries?.();
@@ -21511,7 +21590,6 @@ var dataTools = [
           const allBars = series.bars?.();
           if (!allBars) return { error: 'Bars not available' };
 
-          // Get the last N bars
           const barCount = allBars.size?.() || 0;
           const startIdx = Math.max(0, barCount - numBars);
           const bars = [];
@@ -21577,10 +21655,11 @@ var dataTools = [
       additionalProperties: false
     },
     handler: async () => {
-      const tabId = await requireTvTab2();
+      const tabId = await requireTradingViewTab();
       const indicators = await evaluate(`(() => {
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
+          const api = window.TradingViewApi;
+          const chart = api?.activeChart?.() || window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
           if (!chart) return { error: 'Chart API not available' };
 
           const studies = chart.getAllStudies?.() || [];
@@ -21592,7 +21671,6 @@ var dataTools = [
               visible: true
             };
 
-            // Try to get current values
             try {
               const source = chart.getStudyById?.(study.id);
               if (source) {
@@ -21609,7 +21687,6 @@ var dataTools = [
           return { indicators: result, count: result.length, source: 'api' };
         } catch {}
 
-        // DOM fallback
         try {
           const legends = Array.from(document.querySelectorAll('[class*="sourcesWrapper"] [class*="sources"]'));
           const result = legends.map((el, i) => ({
@@ -21647,12 +21724,13 @@ var dataTools = [
       if (!studyName) {
         throw new Error("studyName must be a non-empty string.");
       }
-      const tabId = await requireTvTab2();
+      const tabId = await requireTradingViewTab();
       const result = await evaluate(`(() => {
         const needle = ${JSON.stringify(studyName)}.toLowerCase();
 
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
+          const api = window.TradingViewApi;
+          const chart = api?.activeChart?.() || window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
           if (!chart) return { error: 'Chart API not available' };
 
           const studies = chart.getAllStudies?.() || [];
@@ -21683,7 +21761,6 @@ var dataTools = [
           };
         } catch {}
 
-        // DOM fallback
         try {
           const legends = Array.from(document.querySelectorAll('[class*="sourcesWrapper"] [class*="sources"]'));
           const match = legends.find(el => {
@@ -21711,7 +21788,7 @@ var dataTools = [
 
 // src/tools/capture.ts
 init_connection();
-async function requireTvTab3() {
+async function requireTvTab() {
   const tab = await findTradingViewTab();
   if (!tab) throw new Error("TradingView is not open. Use tv_open first.");
   return tab.id;
@@ -21736,7 +21813,7 @@ var captureTools = [
       if (!["chart", "full"].includes(region)) {
         throw new Error("region must be either 'chart' or 'full'.");
       }
-      const tabId = await requireTvTab3();
+      const tabId = await requireTvTab();
       const base643 = await screenshot(tabId);
       if (!base643) {
         return textResult("Failed to capture screenshot \u2014 no image data returned.");
@@ -21753,7 +21830,7 @@ var captureTools = [
       additionalProperties: false
     },
     handler: async () => {
-      const tabId = await requireTvTab3();
+      const tabId = await requireTvTab();
       const result = await evaluate(`(() => {
         try {
           // Method 1: Widget API takeScreenshot
@@ -21782,7 +21859,7 @@ var captureTools = [
 
 // src/tools/alerts.ts
 init_connection();
-async function requireTvTab4() {
+async function requireTvTab2() {
   const tab = await findTradingViewTab();
   if (!tab) throw new Error("TradingView is not open. Use tv_open first.");
   return tab.id;
@@ -21797,7 +21874,7 @@ var alertTools = [
       additionalProperties: false
     },
     handler: async () => {
-      const tabId = await requireTvTab4();
+      const tabId = await requireTvTab2();
       const alerts = await evaluate(`(() => {
         // Try to open alerts panel and scrape
         try {
@@ -21863,7 +21940,7 @@ var alertTools = [
       if (!allowedConditions.has(condition)) {
         throw new Error("condition must be one of: crossing, crossing_up, crossing_down, greater_than, less_than.");
       }
-      const tabId = await requireTvTab4();
+      const tabId = await requireTvTab2();
       const result = await evaluate(`(() => {
         const price = ${price};
         const condition = ${JSON.stringify(condition)};
@@ -21900,7 +21977,7 @@ var alertTools = [
 
 // src/tools/drawing.ts
 init_connection();
-async function requireTvTab5() {
+async function requireTvTab3() {
   const tab = await findTradingViewTab();
   if (!tab) throw new Error("TradingView is not open. Use tv_open first.");
   return tab.id;
@@ -21932,7 +22009,7 @@ var drawingTools = [
       if (!["solid", "dashed", "dotted"].includes(lineStyle)) {
         throw new Error("lineStyle must be one of: solid, dashed, dotted.");
       }
-      const tabId = await requireTvTab5();
+      const tabId = await requireTvTab3();
       const lineStyleNum = lineStyle === "dashed" ? 1 : lineStyle === "dotted" ? 2 : 0;
       const result = await evaluate(`(() => {
         const price = ${price};
@@ -21976,7 +22053,7 @@ var drawingTools = [
       additionalProperties: false
     },
     handler: async () => {
-      const tabId = await requireTvTab5();
+      const tabId = await requireTvTab3();
       const drawings = await evaluate(`(() => {
         try {
           const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
@@ -22008,7 +22085,7 @@ var drawingTools = [
       additionalProperties: false
     },
     handler: async () => {
-      const tabId = await requireTvTab5();
+      const tabId = await requireTvTab3();
       const result = await evaluate(`(() => {
         try {
           const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
@@ -22028,7 +22105,7 @@ var drawingTools = [
 
 // src/tools/pine.ts
 init_connection();
-async function requireTvTab6() {
+async function requireTvTab4() {
   const tab = await findTradingViewTab();
   if (!tab) throw new Error("TradingView is not open. Use tv_open first.");
   return tab.id;
@@ -22043,7 +22120,7 @@ var pineTools = [
       additionalProperties: false
     },
     handler: async () => {
-      const tabId = await requireTvTab6();
+      const tabId = await requireTvTab4();
       const result = await evaluate(`(() => {
         // Try clicking the Pine Editor tab
         try {
@@ -22086,7 +22163,7 @@ var pineTools = [
     handler: async (args) => {
       const input = asObject(args, "tv_pine_set_source arguments");
       const code = asString(input.code, "code");
-      const tabId = await requireTvTab6();
+      const tabId = await requireTvTab4();
       const result = await evaluate(`(() => {
         const code = ${JSON.stringify(code)};
 
@@ -22140,7 +22217,7 @@ var pineTools = [
       additionalProperties: false
     },
     handler: async () => {
-      const tabId = await requireTvTab6();
+      const tabId = await requireTvTab4();
       const result = await evaluate(`(() => {
         // Click "Add to Chart" button
         try {
@@ -22170,7 +22247,7 @@ var pineTools = [
       additionalProperties: false
     },
     handler: async () => {
-      const tabId = await requireTvTab6();
+      const tabId = await requireTvTab4();
       const result = await evaluate(`(() => {
         try {
           // Look for error messages in the Pine editor output
@@ -22196,7 +22273,7 @@ var pineTools = [
 
 // src/tools/watchlist.ts
 init_connection();
-async function requireTvTab7() {
+async function requireTvTab5() {
   const tab = await findTradingViewTab();
   if (!tab) throw new Error("TradingView is not open. Use tv_open first.");
   return tab.id;
@@ -22211,7 +22288,7 @@ var watchlistTools = [
       additionalProperties: false
     },
     handler: async () => {
-      const tabId = await requireTvTab7();
+      const tabId = await requireTvTab5();
       const result = await evaluate(`(() => {
         try {
           const rows = document.querySelectorAll('[class*="watchlist"] [class*="listRow"], [data-name="symbol-list"] [class*="row"]');
@@ -22250,7 +22327,7 @@ var watchlistTools = [
     handler: async (args) => {
       const input = asObject(args, "tv_watchlist_add arguments");
       const symbol2 = asString(input.symbol, "symbol");
-      const tabId = await requireTvTab7();
+      const tabId = await requireTvTab5();
       const result = await evaluate(`(() => {
         const symbol = ${JSON.stringify(symbol2)};
 

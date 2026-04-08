@@ -6,81 +6,9 @@
  */
 
 import type { ToolDefinition } from "../types.js";
-import { asObject, asString, asOptionalString, textResult } from "../types.js";
-import { evaluate, findTradingViewTab } from "../connection.js";
-
-async function requireTvTab(): Promise<string> {
-  const tab = await findTradingViewTab();
-  if (!tab) {
-    throw new Error("TradingView is not open. Use tv_open first.");
-  }
-  return tab.id;
-}
-
-/**
- * Internal: Get the active chart object via TradingView's internal API.
- * TradingView web stores the chart widget collection on window.
- */
-const GET_CHART_STATE = `(() => {
-  const w = window;
-  let symbol = null, interval = null, chartType = null, exchange = null;
-  let indicators = [], drawings = [];
-
-  // Try internal widget API first
-  try {
-    const collection = w._exposed_chartWidgetCollection;
-    const widget = collection?.getActive?.();
-    const chart = widget?.activeChart?.();
-    if (chart) {
-      symbol = chart.symbol?.() || null;
-      interval = chart.resolution?.() || null;
-      chartType = String(chart.chartType?.() || '');
-
-      // Get studies/indicators
-      try {
-        const studies = chart.getAllStudies?.() || [];
-        indicators = studies.map(s => ({
-          id: s.id,
-          name: s.name || s.title || '',
-          type: s.type || ''
-        }));
-      } catch {}
-
-      // Get exchange from symbol info
-      try {
-        const info = chart.symbolExt?.() || {};
-        exchange = info.exchange || info.listed_exchange || null;
-      } catch {}
-    }
-  } catch {}
-
-  // DOM fallback for symbol
-  if (!symbol) {
-    try {
-      const el = document.querySelector('[data-symbol-short]');
-      symbol = el?.getAttribute('data-symbol-short') || el?.textContent?.trim() || null;
-    } catch {}
-  }
-
-  // DOM fallback for interval
-  if (!interval) {
-    try {
-      const el = document.querySelector('[data-value][class*="isActive"]');
-      interval = el?.getAttribute('data-value') || el?.textContent?.trim() || null;
-    } catch {}
-  }
-
-  return {
-    symbol,
-    exchange,
-    interval,
-    chartType,
-    indicators,
-    drawingCount: drawings.length,
-    url: window.location.href,
-    ready: !!(symbol && interval)
-  };
-})();`;
+import { asObject, asOptionalString, asString, textResult } from "../types.js";
+import { evaluate } from "../connection.js";
+import { getLivePageState, requireTradingViewTab } from "./live-page.js";
 
 export const chartTools: ToolDefinition[] = [
   {
@@ -93,9 +21,22 @@ export const chartTools: ToolDefinition[] = [
       additionalProperties: false,
     },
     handler: async () => {
-      const tabId = await requireTvTab();
-      const state = await evaluate(GET_CHART_STATE, tabId);
-      return textResult(JSON.stringify(state, null, 2));
+      const tabId = await requireTradingViewTab();
+      const state = await getLivePageState(tabId);
+      return textResult(JSON.stringify({
+        symbol: state.symbol,
+        exchange: state.exchange,
+        interval: state.interval,
+        chartType: state.chartType,
+        indicators: state.indicators,
+        drawingCount: null,
+        lastBar: state.lastBar,
+        url: state.url,
+        ready: state.ready,
+        pathUsed: state.pathUsed,
+        warnings: state.warnings,
+        diagnostics: state.diagnostics,
+      }, null, 2));
     },
   },
 
@@ -116,25 +57,31 @@ export const chartTools: ToolDefinition[] = [
       const input = asObject(args, "tv_set_symbol arguments");
       const symbol = asString(input.symbol, "symbol");
       const exchange = asOptionalString(input.exchange);
-      const tabId = await requireTvTab();
+      const tabId = await requireTradingViewTab();
 
       const fullSymbol = exchange ? `${exchange}:${symbol}` : symbol;
 
       const result = await evaluate(`(() => {
         const fullSymbol = ${JSON.stringify(fullSymbol)};
 
-        // Method 1: Widget API
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart && chart.setSymbol) {
+          const api = window.TradingViewApi;
+          const chart = api?.activeChart?.();
+          if (chart?.setSymbol) {
             chart.setSymbol(fullSymbol);
-            return { method: 'api', symbol: fullSymbol, success: true };
+            return { method: 'tradingview_api', symbol: fullSymbol, success: true };
           }
         } catch {}
 
-        // Method 2: Search box interaction
         try {
-          // Open symbol search
+          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
+          if (chart?.setSymbol) {
+            chart.setSymbol(fullSymbol);
+            return { method: 'widget_collection', symbol: fullSymbol, success: true };
+          }
+        } catch {}
+
+        try {
           const searchBtn = document.querySelector('[data-name="legend-source-item"] button, [aria-label="Symbol Search"]');
           if (searchBtn) {
             searchBtn.click();
@@ -142,16 +89,14 @@ export const chartTools: ToolDefinition[] = [
           }
         } catch {}
 
-        // Method 3: URL navigation
         return { method: 'url', symbol: fullSymbol, success: false, hint: 'Will navigate via URL' };
       })();`, tabId);
 
       const res = result as { method: string; success: boolean; symbol: string; hint?: string };
 
       if (!res.success && res.method === "url") {
-        // Fall back to URL navigation
-        const url = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(fullSymbol)}`;
         const { navigateTab } = await import("../connection.js");
+        const url = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(fullSymbol)}`;
         await navigateTab(url, tabId);
         await new Promise((r) => setTimeout(r, 2000));
         return textResult(JSON.stringify({ success: true, symbol: fullSymbol, method: "url_navigate" }, null, 2));
@@ -164,7 +109,7 @@ export const chartTools: ToolDefinition[] = [
   {
     name: "tv_set_timeframe",
     description:
-      "Change the chart timeframe/interval. Common values: 1, 5, 15, 30, 60, 240, D, W, M (minutes for numbers, D=daily, W=weekly, M=monthly).",
+      "Change the chart timeframe/interval. Common values: 1, 5, 15, 30, 60, 240, D, W, M (minutes for numbers, D=daily, W=weekly, M=monthly). Returns whether the requested interval was actually observed after the change.",
     inputSchema: {
       type: "object",
       properties: {
@@ -179,35 +124,65 @@ export const chartTools: ToolDefinition[] = [
       if (!/^(?:[1-9]\d{0,3}|D|W|M)$/.test(interval)) {
         throw new Error("interval must be a TradingView resolution like 1, 5, 15, 60, 240, D, W, or M.");
       }
-      const tabId = await requireTvTab();
+      const tabId = await requireTradingViewTab();
 
-      const result = await evaluate(`(() => {
-        const interval = ${JSON.stringify(interval)};
+      const attempt = await evaluate(`(() => {
+        const targetInterval = ${JSON.stringify(interval)};
+        const warnings = [];
+        let pathUsed = 'none';
 
-        // Method 1: Widget API
+        try {
+          const api = window.TradingViewApi;
+          const chart = api?.activeChart?.();
+          if (chart?.setResolution) {
+            chart.setResolution(targetInterval);
+            pathUsed = 'tradingview_api';
+            return { accepted: true, requestedInterval: targetInterval, pathUsed, warnings };
+          }
+        } catch (error) {
+          warnings.push('TradingViewApi setResolution failed: ' + (error?.message || String(error)));
+        }
+
         try {
           const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart && chart.setResolution) {
-            chart.setResolution(interval);
-            return { success: true, interval, method: 'api' };
+          if (chart?.setResolution) {
+            chart.setResolution(targetInterval);
+            pathUsed = 'widget_collection';
+            return { accepted: true, requestedInterval: targetInterval, pathUsed, warnings };
           }
-        } catch {}
+        } catch (error) {
+          warnings.push('Widget collection setResolution failed: ' + (error?.message || String(error)));
+        }
 
-        // Method 2: Click the timeframe button in the toolbar
         try {
-          const buttons = Array.from(document.querySelectorAll('[data-value]'));
-          const match = buttons.find(b => b.getAttribute('data-value') === interval);
-          if (match) {
+          const buttons = Array.from(document.querySelectorAll('[data-value], button[data-value]'));
+          const match = buttons.find((button) => button.getAttribute('data-value') === targetInterval || button.textContent?.trim() === targetInterval);
+          if (match instanceof HTMLElement) {
             match.click();
-            return { success: true, interval, method: 'click' };
+            pathUsed = 'dom';
+            return { accepted: true, requestedInterval: targetInterval, pathUsed, warnings };
           }
-        } catch {}
+        } catch (error) {
+          warnings.push('DOM timeframe click failed: ' + (error?.message || String(error)));
+        }
 
-        // Method 3: Keyboard shortcut — numbers set timeframe in TV
-        return { success: false, interval, hint: 'Could not set timeframe via API or DOM' };
-      })();`, tabId);
+        warnings.push('Could not find a live TradingView timeframe control.');
+        return { accepted: false, requestedInterval: targetInterval, pathUsed, warnings };
+      })();`, tabId) as { accepted: boolean; requestedInterval: string; pathUsed: string; warnings: string[] };
 
-      return textResult(JSON.stringify(result, null, 2));
+      await new Promise((r) => setTimeout(r, 500));
+      const state = await getLivePageState(tabId);
+      const success = !!attempt.accepted && state.interval === interval;
+
+      return textResult(JSON.stringify({
+        success,
+        requestedInterval: interval,
+        actualInterval: state.interval,
+        symbol: state.symbol,
+        pathUsed: attempt.pathUsed,
+        verificationPath: state.pathUsed === 'tradingview_api' && state.diagnostics.getSymbolInterval ? 'getSymbolInterval' : state.pathUsed,
+        warnings: success ? attempt.warnings : [...attempt.warnings, `Requested ${interval} but observed ${state.interval ?? 'unknown'}.`],
+      }, null, 2));
     },
   },
 
@@ -229,7 +204,7 @@ export const chartTools: ToolDefinition[] = [
     handler: async (args) => {
       const input = asObject(args, "tv_set_chart_type arguments");
       const chartType = asString(input.chartType, "chartType");
-      const tabId = await requireTvTab();
+      const tabId = await requireTradingViewTab();
 
       const CHART_TYPE_MAP: Record<string, number> = {
         bars: 0, candles: 1, hollow_candles: 9, heikin_ashi: 8,
@@ -244,13 +219,21 @@ export const chartTools: ToolDefinition[] = [
 
       const result = await evaluate(`(() => {
         try {
-          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart && chart.setChartType) {
+          const api = window.TradingViewApi;
+          const chart = api?.activeChart?.();
+          if (chart?.setChartType) {
             chart.setChartType(${typeNum});
-            return { success: true, chartType: ${JSON.stringify(chartType)}, method: 'api' };
+            return { success: true, chartType: ${JSON.stringify(chartType)}, pathUsed: 'tradingview_api' };
           }
         } catch {}
-        return { success: false, chartType: ${JSON.stringify(chartType)}, hint: 'Widget API not available' };
+        try {
+          const chart = window._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
+          if (chart?.setChartType) {
+            chart.setChartType(${typeNum});
+            return { success: true, chartType: ${JSON.stringify(chartType)}, pathUsed: 'widget_collection' };
+          }
+        } catch {}
+        return { success: false, chartType: ${JSON.stringify(chartType)}, pathUsed: 'none', hint: 'Chart type API not available' };
       })();`, tabId);
 
       return textResult(JSON.stringify(result, null, 2));

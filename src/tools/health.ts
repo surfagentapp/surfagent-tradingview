@@ -4,13 +4,14 @@
 
 import type { ToolDefinition } from "../types.js";
 import { asObject, asOptionalString, textResult } from "../types.js";
-import { findTradingViewTab, evaluate, listTabs, navigateTab } from "../connection.js";
+import { findTradingViewTab, navigateTab } from "../connection.js";
+import { getLivePageState } from "./live-page.js";
 
 export const healthTools: ToolDefinition[] = [
   {
     name: "tv_health_check",
     description:
-      "Check if TradingView is open in the SurfAgent browser and the chart widget is accessible. Returns status, URL, symbol info, and chart readiness.",
+      "Check if TradingView is open in the SurfAgent browser and whether the live chart page is actually readable. Returns status, URL, symbol info, readiness, and lightweight diagnostics.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -29,54 +30,22 @@ export const healthTools: ToolDefinition[] = [
         );
       }
 
-      // Check if the TradingView chart widget is loaded
-      const state = await evaluate(`(() => {
-        const w = window;
-        const hasWidget = !!(w.TradingView || w.tvWidget || document.querySelector('.chart-container, .layout__area--center'));
-        const hasApi = !!(w._exposed_chartWidgetCollection || w.TradingView?.activeChart);
-
-        // Try to get current symbol from various TradingView internal paths
-        let symbol = null;
-        let interval = null;
-        let chartType = null;
-
-        try {
-          // Path 1: Widget API
-          const chart = w._exposed_chartWidgetCollection?.getActive?.()?.activeChart?.();
-          if (chart) {
-            symbol = chart.symbol?.() || null;
-            interval = chart.resolution?.() || null;
-            chartType = String(chart.chartType?.() || '');
-          }
-        } catch {}
-
-        if (!symbol) {
-          try {
-            // Path 2: DOM scraping
-            const symbolEl = document.querySelector('[data-symbol-short], .chart-controls-bar .apply-common-tooltip');
-            symbol = symbolEl?.textContent?.trim() || null;
-
-            const intervalEl = document.querySelector('[data-value][class*="isActive"], .chart-controls-bar button[class*="isActive"]');
-            interval = intervalEl?.getAttribute('data-value') || intervalEl?.textContent?.trim() || null;
-          } catch {}
-        }
-
-        return {
-          hasWidget,
-          hasApi,
-          symbol,
-          interval,
-          chartType,
-          url: window.location.href,
-          title: document.title,
-        };
-      })();`, tab.id);
-
+      const state = await getLivePageState(tab.id);
       return textResult(
         JSON.stringify({
-          status: "connected",
+          status: state.ready ? "connected" : "degraded",
           tabId: tab.id,
-          ...(state as Record<string, unknown>),
+          url: state.url,
+          title: state.title,
+          symbol: state.symbol,
+          interval: state.interval,
+          chartType: state.chartType,
+          hasWidget: state.hasWidget,
+          hasApi: state.hasApi,
+          ready: state.ready,
+          pathUsed: state.pathUsed,
+          warnings: state.warnings,
+          diagnostics: state.diagnostics,
         }, null, 2)
       );
     },
@@ -111,7 +80,6 @@ export const healthTools: ToolDefinition[] = [
         url = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(fullSymbol)}`;
       }
 
-      // Check if TV is already open
       const existing = await findTradingViewTab();
       if (existing) {
         await navigateTab(url, existing.id);
@@ -126,7 +94,6 @@ export const healthTools: ToolDefinition[] = [
       }
 
       const tab = await navigateTab(url);
-      // Wait for chart to load
       await new Promise((r) => setTimeout(r, 3000));
 
       return textResult(
