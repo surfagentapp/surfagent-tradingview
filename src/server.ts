@@ -23,7 +23,7 @@ import { drawingTools } from "./tools/drawing.js";
 import { pineTools } from "./tools/pine.js";
 import { watchlistTools } from "./tools/watchlist.js";
 
-const TOOL_SET: ToolDefinition[] = [
+export const TOOL_SET: ToolDefinition[] = [
   ...healthTools,
   ...chartTools,
   ...dataTools,

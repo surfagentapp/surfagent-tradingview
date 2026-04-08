@@ -15,6 +15,16 @@ const TOKEN_PATH = join(homedir(), ".surfagent", "daemon-token.txt");
 
 let cachedToken: string | null | undefined;
 
+async function readDaemonError(path: string, res: Response): Promise<never> {
+  const text = await res.text();
+  if (res.status === 401) {
+    throw new Error(
+      `${path} failed (HTTP 401): Unauthorized. Check SURFAGENT_AUTH_TOKEN or ~/.surfagent/daemon-token.txt.`,
+    );
+  }
+  throw new Error(`${path} failed (HTTP ${res.status}): ${text}`);
+}
+
 function getAuthToken(): string | null {
   if (cachedToken !== undefined) return cachedToken;
 
@@ -71,10 +81,7 @@ export async function evaluate(expression: string, tabId?: string): Promise<unkn
     signal: AbortSignal.timeout(15_000),
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Daemon evaluate failed (HTTP ${res.status}): ${text}`);
-  }
+  if (!res.ok) await readDaemonError("/browser/evaluate", res);
 
   const data = (await res.json()) as EvalResult;
   if (!data.ok) {
@@ -98,10 +105,7 @@ export async function navigateTab(url: string, tabId?: string): Promise<TabInfo>
     signal: AbortSignal.timeout(30_000),
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Navigate failed (HTTP ${res.status}): ${text}`);
-  }
+  if (!res.ok) await readDaemonError("/browser/navigate", res);
 
   const data = (await res.json()) as { ok: boolean; tab?: TabInfo; error?: string };
   if (!data.ok || !data.tab) {
@@ -124,10 +128,7 @@ export async function screenshot(tabId?: string): Promise<string> {
     signal: AbortSignal.timeout(15_000),
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Screenshot failed (HTTP ${res.status}): ${text}`);
-  }
+  if (!res.ok) await readDaemonError("/browser/screenshot", res);
 
   const data = (await res.json()) as { ok: boolean; image?: string; screenshot?: string; error?: string };
   const imageData = data.image ?? data.screenshot;
@@ -146,10 +147,7 @@ export async function listTabs(): Promise<TabInfo[]> {
     signal: AbortSignal.timeout(10_000),
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`List tabs failed (HTTP ${res.status}): ${text}`);
-  }
+  if (!res.ok) await readDaemonError("/browser/tabs", res);
 
   const data = (await res.json()) as { ok: boolean; tabs?: TabInfo[]; error?: string };
   if (!data.ok) {
@@ -169,10 +167,7 @@ export async function openTab(url: string): Promise<TabInfo> {
     signal: AbortSignal.timeout(30_000),
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Open tab failed (HTTP ${res.status}): ${text}`);
-  }
+  if (!res.ok) await readDaemonError("/browser/navigate", res);
 
   const data = (await res.json()) as { ok: boolean; tab?: TabInfo; error?: string };
   if (!data.ok || !data.tab) {
@@ -191,10 +186,7 @@ export async function closeTab(tabId: string): Promise<void> {
     signal: AbortSignal.timeout(10_000),
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Close tab failed (HTTP ${res.status}): ${text}`);
-  }
+  if (!res.ok) await readDaemonError(`/browser/tabs/${tabId}`, res);
 }
 
 /**
