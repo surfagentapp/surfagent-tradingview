@@ -111,23 +111,27 @@ export const dataTools: ToolDefinition[] = [
           const series = chart.getSeries?.();
           if (!series) return { error: 'Series not available' };
 
-          const allBars = series.bars?.();
-          if (!allBars) return { error: 'Bars not available' };
+          const data = series.data?.();
+          if (!data) return { error: 'Series data not available' };
 
-          const barCount = allBars.size?.() || 0;
-          const startIdx = Math.max(0, barCount - numBars);
+          const first = data.first?.();
+          const barCount = series.barsCount?.() || 0;
+          const firstIndex = typeof first?.index === 'number' ? first.index : null;
+          if (firstIndex == null || barCount <= 0) return { error: 'No bar data available' };
+
+          const startOffset = Math.max(0, barCount - numBars);
           const bars = [];
 
-          for (let i = startIdx; i < barCount; i++) {
-            const bar = allBars.valueAt?.(i);
-            if (bar) {
+          for (let offset = startOffset; offset < barCount; offset++) {
+            const tuple = data.valueAt?.(firstIndex + offset);
+            if (Array.isArray(tuple)) {
               bars.push({
-                time: bar.time,
-                open: bar.open,
-                high: bar.high,
-                low: bar.low,
-                close: bar.close,
-                volume: bar.volume
+                time: tuple[0],
+                open: tuple[1],
+                high: tuple[2],
+                low: tuple[3],
+                close: tuple[4],
+                volume: tuple[5] ?? null
               });
             }
           }

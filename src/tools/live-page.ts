@@ -90,16 +90,21 @@ export const LIVE_PAGE_STATE_SCRIPT = `(() => {
     } catch {}
     try {
       const series = chart.getSeries?.();
-      const bars = series?.bars?.();
-      const lastBar = bars?.last?.();
-      if (lastBar) {
+      const data = series?.data?.();
+      const first = data?.first?.();
+      const barsCount = series?.barsCount?.();
+      const firstIndex = typeof first?.index === 'number' ? first.index : null;
+      const lastTuple = typeof firstIndex === 'number' && typeof barsCount === 'number' && barsCount > 0
+        ? data?.valueAt?.(firstIndex + barsCount - 1)
+        : null;
+      if (Array.isArray(lastTuple)) {
         out.lastBar = {
-          time: safeValue(lastBar.time),
-          open: safeValue(lastBar.open),
-          high: safeValue(lastBar.high),
-          low: safeValue(lastBar.low),
-          close: safeValue(lastBar.close),
-          volume: safeValue(lastBar.volume),
+          time: safeValue(lastTuple[0]),
+          open: safeValue(lastTuple[1]),
+          high: safeValue(lastTuple[2]),
+          low: safeValue(lastTuple[3]),
+          close: safeValue(lastTuple[4]),
+          volume: safeValue(lastTuple[5]),
         };
       }
     } catch {}
