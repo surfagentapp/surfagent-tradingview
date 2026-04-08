@@ -31,8 +31,9 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "npm run typecheck && esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/index.js && esbuild src/smoke.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/smoke.js && chmod +x dist/index.js",
-    "smoke": "npm run build && node dist/smoke.js",
+    "build": "npm run typecheck && esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/index.js && esbuild src/smoke.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/smoke.js && esbuild src/contract-smoke.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/contract-smoke.js && chmod +x dist/index.js",
+    "smoke": "npm run build && node dist/smoke.js && node dist/contract-smoke.js",
+    "smoke:contracts": "npm run build && node dist/contract-smoke.js",
     "start": "node dist/index.js"
   },
   "dependencies": {
