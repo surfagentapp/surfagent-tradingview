@@ -38,6 +38,17 @@ Some tools are stronger than others:
 
 That distinction matters. TradingView still exposes some surfaces only through the live web UI, so this adapter stays honest about best-effort operations instead of pretending every tool is equally native.
 
+## Default operating mode
+
+TradingView should be treated as a **state-first** surface.
+
+That means:
+- trust adapter chart state, quote, OHLCV, indicator, drawing, and Pine outputs before screenshots
+- use screenshots or perception mainly for rendered-chart proof, modal confirmation, or premium-gate diagnosis
+- avoid turning structured chart tasks into screenshot-only guesswork
+
+If the question is “what does the chart look like?”, visual proof matters. If the question is “what symbol, timeframe, or study state is active?”, adapter state should usually win.
+
 ## Tool groups
 
 ### Health and setup
@@ -126,6 +137,11 @@ Run this adapter alongside the base SurfAgent MCP.
 - use `surfagent-mcp` for raw browser control
 - use `surfagent-skills` for execution discipline and workflow rules
 - use `surfagent-tradingview` when you want TradingView-aware tools instead of rebuilding the workflow from raw browser actions each time
+
+Practical rule:
+- chart/data problem -> adapter first
+- rendered visual proof problem -> adapter plus screenshot/perception
+- one-off unsupported UI probe -> targeted browser control
 
 ## Why SurfAgent instead of TradingView Desktop-only automation
 
